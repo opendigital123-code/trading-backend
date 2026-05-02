@@ -1,18 +1,14 @@
 {
-  "name": "backend",
+  "name": "bot-autonome-rsi",
   "version": "1.0.0",
-  "description": "",
-  "main": "server.js",
+  "description": "Bot autonome calculant le RSI via FP Markets",
+  "main": "index.js",
   "scripts": {
-    "start": "node server.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
   "dependencies": {
-    "axios": "^1.15.2",
-    "express": "^5.2.1"
+    "express": "^4.18.2",
+    "metaapi.cloud-sdk": "^24.0.0",
+    "technicalindicators": "^3.1.0"
   }
 }
