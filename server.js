@@ -1,140 +1,115 @@
 const express = require('express');
-const axios = require('axios');
+const MetaApi = require('metaapi.cloud-sdk').default;
+const { RSI } = require('technicalindicators');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const META_API_TOKEN = process.env.META_API_TOKEN || 'NON_CONFIGURE';
+const ACCOUNT_ID = process.env.META_API_ACCOUNT_ID || 'NON_CONFIGURE';
 
-const MARKET_OPTIONS = {
-  crypto: {
-    BTCUSDT: 'BTC/USDT',
-    ETHUSDT: 'ETH/USDT',
-    BNBUSDT: 'BNB/USDT',
-    SOLUSDT: 'SOL/USDT',
-  },
-  forex: {
-    'EURUSD=X': 'EUR/USD',
-    'GBPUSD=X': 'GBP/USD',
-    'USDJPY=X': 'USD/JPY',
-    'AUDUSD=X': 'AUD/USD',
-  },
-};
+// ====================================================================
+// LISTE DES ACTIFS A SURVEILLER (5 FOREX + 5 CRYPTO)
+// ====================================================================
+const SYMBOLS = [
+    // Forex
+    'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD',
+    // Crypto
+    'BTCUSD', 'ETHUSD', 'BNBUSD', 'SOLUSD', 'XRPUSD'
+];
 
-const CRYPTO_YAHOO_SYMBOLS = {
-  BTCUSDT: 'BTC-USD',
-  ETHUSDT: 'ETH-USD',
-  BNBUSDT: 'BNB-USD',
-  SOLUSDT: 'SOL-USD',
-};
+// Configuration du RSI
+const RSI_PERIOD = 14;
+const SURVENDU = 30;  // En dessous de 30 = ACHAT
+const SURACHETE = 70; // Au dessus de 70 = VENTE
 
-function calculateRSI(prices, period = 14) {
-  const gains = [];
-  const losses = [];
+// Page web minimaliste pour garder le bot en vie sur Render
+app.get('/', (req, res) => res.send('🟢 Bot RSI Autonome Actif ! Surveillance de 10 paires.'));
+app.listen(PORT, () => console.log(`🚀 Serveur web démarré sur le port ${PORT}`));
 
-  for (let i = 1; i < prices.length; i++) {
-    const diff = prices[i] - prices[i - 1];
+// ====================================================================
+// FONCTION PRINCIPALE : L'ANALYSE DU MARCHE
+// ====================================================================
+async function analyserMarche() {
+    console.log('\n⏳ --- DÉBUT DE L\'ANALYSE DES 10 PAIRES ---');
 
-    if (diff >= 0) {
-      gains.push(diff);
-      losses.push(0);
-    } else {
-      gains.push(0);
-      losses.push(Math.abs(diff));
+    // MODE SIMULATION : Si clés non configurées
+    if (META_API_TOKEN === 'NON_CONFIGURE') {
+        console.log('⚠️ MODE SIMULATION : Génération de faux prix pour test...');
+        
+        for (const symbol of SYMBOLS) {
+            // Génère 15 faux prix entre 50 et 150 pour que le RSI calcule quelque chose
+            let fauxPrixCloture = Array.from({length: 15}, () => Math.random() * 100 + 50);
+            calculerEtAfficherSignal(symbol, fauxPrixCloture);
+        }
+        return; 
     }
-  }
 
-  const avgGain = gains.slice(-period).reduce((a, b) => a + b, 0) / period;
-  const avgLoss = losses.slice(-period).reduce((a, b) => a + b, 0) / period;
+    // MODE REEL/DEMO (FP MARKETS via MetaApi)
+    try {
+        const api = new MetaApi(META_API_TOKEN);
+        const account = await api.metatraderAccountApi.getAccount(ACCOUNT_ID);
+        
+        if (account.state !== 'DEPLOYED') await account.deploy();
+        await account.waitConnected();
+        
+        const connection = account.getRPCConnection();
+        await connection.connect();
+        await connection.waitSynchronized();
 
-  if (avgLoss === 0) return 100;
-
-  const rs = avgGain / avgLoss;
-  return 100 - 100 / (1 + rs);
+        for (const symbol of SYMBOLS) {
+            console.log(`📊 Lecture de ${symbol}...`);
+            // Historique des 15 dernières heures
+            const history = await connection.getHistoryStorage().getHistoricalCandles(symbol, '1h', new Date(Date.now() - 24*60*60*1000), new Date());
+            
+            if (history && history.length >= RSI_PERIOD) {
+                const prixCloture = history.map(candle => candle.close);
+                calculerEtAfficherSignal(symbol, prixCloture);
+            } else {
+                console.log(`❌ Pas assez de données MT5 pour ${symbol}`);
+            }
+        }
+    } catch (error) {
+        console.error('❌ ERREUR MT5 :', error.message);
+    }
 }
 
-function resolveMarket(type, symbol) {
-  const marketType = type === 'forex' ? 'forex' : 'crypto';
-  const options = MARKET_OPTIONS[marketType];
-  const fallbackSymbol = Object.keys(options)[0];
-  const resolvedSymbol = options[symbol] ? symbol : fallbackSymbol;
+// ====================================================================
+// CALCUL DU RSI ET AFFICHAGE
+// ====================================================================
+function calculerEtAfficherSignal(symbol, prixCloture) {
+    const rsiResultat = RSI.calculate({
+        values: prixCloture,
+        period: RSI_PERIOD
+    });
 
-  return {
-    type: marketType,
-    symbol: resolvedSymbol,
-    displaySymbol: options[resolvedSymbol],
-  };
+    const rsiActuel = rsiResultat[rsiResultat.length - 1]; 
+    const rsiArrondi = rsiActuel.toFixed(2);
+    
+    // Détection automatique Crypto / Forex pour un bel affichage
+    const cryptosTokens = ['BTC', 'ETH', 'BNB', 'SOL', 'XRP'];
+    const estCrypto = cryptosTokens.some(crypto => symbol.includes(crypto));
+    const typeMarche = estCrypto ? 'CRYPTO' : 'FOREX';
+
+    console.log(`\n---------------------------------`);
+    console.log(`🪙 Actif  : ${symbol} (${typeMarche})`);
+    console.log(`📈 RSI    : ${rsiArrondi}`);
+
+    if (rsiActuel <= SURVENDU) {
+        console.log('🟢 SIGNAL : ACHAT (BUY) 🟢');
+    } else if (rsiActuel >= SURACHETE) {
+        console.log('🔴 SIGNAL : VENTE (SELL) 🔴');
+    } else {
+        console.log('🟡 SIGNAL : HOLD (Zone Neutre)');
+    }
 }
 
-async function fetchYahooMarket(symbol) {
-  const response = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}`, {
-    params: {
-      interval: '5m',
-      range: '1d',
-    },
-  });
+// ====================================================================
+// LE MOTEUR
+// ====================================================================
+console.log("👀 Démarrage du moteur de trading...");
 
-  const result = response.data?.chart?.result?.[0];
-  const closes = result?.indicators?.quote?.[0]?.close ?? [];
+// 1er lancement immédiat
+analyserMarche();
 
-  return closes.map(Number).filter((price) => Number.isFinite(price) && price > 0);
-}
-
-async function fetchCryptoMarket(symbol) {
-  const yahooSymbol = CRYPTO_YAHOO_SYMBOLS[symbol];
-
-  if (!yahooSymbol) {
-    throw new Error(`Unsupported crypto symbol ${symbol}`);
-  }
-
-  return fetchYahooMarket(yahooSymbol);
-}
-
-async function fetchForexMarket(symbol) {
-  return fetchYahooMarket(symbol);
-}
-
-async function getMarketSnapshot(type, symbol) {
-  const market = resolveMarket(type, symbol);
-  const closes =
-    market.type === 'forex'
-      ? await fetchForexMarket(market.symbol)
-      : await fetchCryptoMarket(market.symbol);
-
-  if (closes.length < 15) {
-    throw new Error(`Not enough price data for ${market.displaySymbol}`);
-  }
-
-  return {
-    type: market.type,
-    symbol: market.displaySymbol,
-    marketPrice: closes[closes.length - 1],
-    rsi: calculateRSI(closes),
-  };
-}
-
-app.get('/health', (req, res) => {
-  res.json({ ok: true });
-});
-
-app.get('/market', async (req, res) => {
-  try {
-    const snapshot = await getMarketSnapshot(req.query.type, req.query.symbol);
-    res.json(snapshot);
-  } catch (error) {
-    console.log(error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.get('/rsi', async (req, res) => {
-  try {
-    const snapshot = await getMarketSnapshot('crypto', 'BTCUSDT');
-    res.json(snapshot);
-  } catch (error) {
-    console.log(error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Serveur lance sur http://0.0.0.0:${PORT}`);
-});
+// Boucle infinie : Relance l'analyse toutes les minutes (60000 ms)
+setInterval(analyserMarche, 60000);
