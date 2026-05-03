@@ -8,7 +8,7 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// ==================== FONCTIONS INDICATEURS ====================
+// ==================== FONCTIONS ====================
 
 function calculateRSI(prices, period = 14) {
   if (prices.length < period + 1) return 50;
@@ -47,21 +47,34 @@ function calculateEMA(prices, period) {
 
 app.get('/market', async (req, res) => {
   try {
-    const { symbol = 'BTCUSDT', interval = '15m' } = req.query;
+    const { symbol = 'BTCUSDT', type = 'crypto' } = req.query;
 
-    const response = await axios.get('https://api.binance.com/api/v3/klines', {
-      params: { symbol: symbol.toUpperCase(), interval, limit: 300 },
+    let yahooSymbol = symbol;
+
+    if (type === 'crypto') {
+      const map = {
+        'BTCUSDT': 'BTC-USD',
+        'ETHUSDT': 'ETH-USD',
+        'BNBUSDT': 'BNB-USD',
+        'SOLUSDT': 'SOL-USD'
+      };
+      yahooSymbol = map[symbol] || 'BTC-USD';
+    }
+
+    const response = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${yahooSymbol}`, {
+      params: { interval: '5m', range: '5d' },
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
       },
-      timeout: 15000
+      timeout: 10000
     });
 
-    const closes = response.data.map(k => parseFloat(k[4]));
+    const result = response.data?.chart?.result?.[0];
+    if (!result) throw new Error('Pas de données Yahoo');
 
-    if (closes.length < 50) {
-      throw new Error('Données insuffisantes de Binance');
-    }
+    const closes = result.indicators?.quote?.[0]?.close?.filter(price => price && price > 0) || [];
+
+    if (closes.length < 50) throw new Error('Données insuffisantes');
 
     const currentPrice = closes[closes.length - 1];
     const rsi = calculateRSI(closes);
@@ -80,7 +93,7 @@ app.get('/market', async (req, res) => {
     }
 
     res.json({
-      symbol,
+      symbol: symbol,
       marketPrice: Number(currentPrice.toFixed(4)),
       rsi: Number(rsi.toFixed(2)),
       ema50: Number(ema50.toFixed(2)),
@@ -91,10 +104,8 @@ app.get('/market', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Error:', error.message);
-    res.status(500).json({ 
-      error: error.message || 'Erreur interne du serveur' 
-    });
+    console.error('Erreur:', error.message);
+    res.status(500).json({ error: error.message });
   }
 });
 
