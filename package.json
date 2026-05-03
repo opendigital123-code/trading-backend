@@ -1,7 +1,6 @@
 {
-  "name": "bot-autonome-rsi",
+  "name": "bot-rsi",
   "version": "1.0.0",
-  "description": "Bot autonome calculant le RSI via FP Markets",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
