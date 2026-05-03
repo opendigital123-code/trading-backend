@@ -8,19 +8,25 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', time: new Date() });
+});
+
+// Calculs techniques
 function calculateRSI(prices, period = 14) {
   if (prices.length < period + 1) return 50;
   let avgGain = 0, avgLoss = 0;
 
   for (let i = 1; i <= period; i++) {
-    const diff = prices[i] - prices[i-1];
-    if (diff > 0) avgGain += diff; else avgLoss -= diff;
+    const diff = prices[i] - prices[i - 1];
+    if (diff > 0) avgGain += diff;
+    else avgLoss -= diff;
   }
   avgGain /= period;
   avgLoss /= period;
 
   for (let i = period + 1; i < prices.length; i++) {
-    const diff = prices[i] - prices[i-1];
+    const diff = prices[i] - prices[i - 1];
     avgGain = (avgGain * (period - 1) + Math.max(diff, 0)) / period;
     avgLoss = (avgLoss * (period - 1) + Math.max(-diff, 0)) / period;
   }
@@ -40,61 +46,42 @@ function calculateEMA(prices, period) {
   return result;
 }
 
-function calculateMACD(prices) {
-  const ema12 = calculateEMA(prices, 12);
-  const ema26 = calculateEMA(prices, 26);
-  const macdLine = ema12.map((v, i) => v - ema26[i]);
-  const signalLine = calculateEMA(macdLine, 9);
-  const histogram = macdLine.map((v, i) => v - signalLine[i]);
-  return { macdLine, signalLine, histogram };
-}
-
-function generateAdvancedSignal(data) {
-  const { rsi, ema50, ema200, macd, currentPrice } = data;
-  let score = 0;
-  const reasons = [];
-
-  if (rsi < 25) { score += 3; reasons.push("RSI très survente"); }
-  else if (rsi < 32) { score += 1.5; reasons.push("RSI survente"); }
-
-  if (rsi > 75) { score -= 3; reasons.push("RSI très surachat"); }
-  else if (rsi > 68) { score -= 1.5; reasons.push("RSI surachat"); }
-
-  if (currentPrice > ema50 && ema50 > ema200) { score += 3; reasons.push("Tendance haussière"); }
-  if (currentPrice < ema50 && ema50 < ema200) { score -= 3; reasons.push("Tendance baissière"); }
-
-  const lastMacd = macd.macdLine[macd.macdLine.length-1];
-  const lastSignal = macd.signalLine[macd.signalLine.length-1];
-  if (lastMacd > lastSignal) { score += 1.5; reasons.push("MACD haussier"); }
-  if (lastMacd < lastSignal) { score -= 1.5; reasons.push("MACD baissier"); }
-
-  let signal = 'HOLD';
-  let strength = 'MOYEN';
-
-  if (score >= 5) { signal = 'BUY'; strength = 'FORT'; }
-  else if (score >= 2.5) { signal = 'BUY'; }
-  else if (score <= -5) { signal = 'SELL'; strength = 'FORT'; }
-  else if (score <= -2.5) { signal = 'SELL'; }
-
-  return { signal, strength, score: Number(score.toFixed(1)), reasons: reasons.slice(0, 3) };
-}
-
 app.get('/market', async (req, res) => {
   try {
     const { symbol = 'BTCUSDT', interval = '15m' } = req.query;
-    const response = await axios.get(`https://api.binance.com/api/v3/klines`, {
-      params: { symbol, interval, limit: 500 }
+
+    // Fetch from Binance
+    const response = await axios.get('https://api.binance.com/api/v3/klines', {
+      params: {
+        symbol: symbol.toUpperCase(),
+        interval,
+        limit: 300
+      },
+      timeout: 10000
     });
 
     const closes = response.data.map(k => parseFloat(k[4]));
+    if (closes.length < 50) {
+      throw new Error('Not enough data from Binance');
+    }
+
     const currentPrice = closes[closes.length - 1];
-
     const rsi = calculateRSI(closes);
-    const ema50 = calculateEMA(closes, 50)[closes.length-1];
-    const ema200 = calculateEMA(closes, 200)[closes.length-1];
-    const macd = calculateMACD(closes);
+    const ema50 = calculateEMA(closes, 50)[closes.length - 1];
+    const ema200 = calculateEMA(closes, 200)[closes.length - 1];
 
-    const signalData = generateAdvancedSignal({ rsi, ema50, ema200, macd, currentPrice });
+    // Signal simple mais fiable
+    let signal = 'HOLD';
+    let strength = 'MOYEN';
+
+    if (rsi < 30 && currentPrice > ema50) {
+      signal = 'BUY';
+      strength = rsi < 25 ? 'FORT' : 'MOYEN';
+    } 
+    else if (rsi > 70 && currentPrice < ema50) {
+      signal = 'SELL';
+      strength = rsi > 75 ? 'FORT' : 'MOYEN';
+    }
 
     res.json({
       symbol,
@@ -102,19 +89,20 @@ app.get('/market', async (req, res) => {
       rsi: Number(rsi.toFixed(2)),
       ema50: Number(ema50.toFixed(2)),
       ema200: Number(ema200.toFixed(2)),
-      signal: signalData.signal,
-      strength: signalData.strength,
-      reasons: signalData.reasons,
+      signal,
+      strength,
       timestamp: new Date().toISOString()
     });
+
   } catch (error) {
-    console.error(error.message);
-    res.status(500).json({ error: error.message });
+    console.error('Error:', error.message);
+    res.status(500).json({ 
+      error: error.message || 'Internal server error',
+      tip: 'Vérifie que le symbol est correct (ex: BTCUSDT)'
+    });
   }
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
-
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Advanced Trading Server on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
