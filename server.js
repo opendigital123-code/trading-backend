@@ -10,9 +10,9 @@ app.use(express.json());
 
 // Cache
 const CACHE = new Map();
-const CACHE_DURATION = 12000;
+const CACHE_DURATION = 10000;
 
-// ==================== FONCTIONS ====================
+// ==================== FONCTIONS (inchangées) ====================
 function calculateRSI(prices, period = 14) {
   if (prices.length < period + 1) return 50;
   let avgGain = 0, avgLoss = 0;
@@ -20,7 +20,7 @@ function calculateRSI(prices, period = 14) {
   for (let i = 1; i <= period; i++) {
     const diff = prices[i] - prices[i - 1];
     if (diff > 0) avgGain += diff;
-    else avgLoss -= diff;
+    else avgLoss += Math.abs(diff);
   }
   avgGain /= period;
   avgLoss /= period;
@@ -32,15 +32,17 @@ function calculateRSI(prices, period = 14) {
   }
 
   if (avgLoss === 0) return 100;
-  return 100 - 100 / (1 + avgGain / avgLoss);
+  return 100 - (100 / (1 + avgGain / avgLoss));
 }
 
 function calculateEMA(prices, period) {
   if (prices.length < period) return prices[prices.length - 1] || 0;
+  let sum = prices.slice(0, period).reduce((a, b) => a + b, 0);
+  let ema = sum / period;
   const k = 2 / (period + 1);
-  let ema = prices[0];
-  const result = [ema];
-  for (let i = 1; i < prices.length; i++) {
+  const result = [...Array(period).fill(ema)];
+
+  for (let i = period; i < prices.length; i++) {
     ema = prices[i] * k + ema * (1 - k);
     result.push(ema);
   }
@@ -48,6 +50,10 @@ function calculateEMA(prices, period) {
 }
 
 function generateMultiFactorSignal(closes) {
+  if (closes.length < 150) {
+    return { signal: 'HOLD', strength: 'FAIBLE', rsi: 50, ema50: 0, ema200: 0, reasons: ["Données insuffisantes"] };
+  }
+
   const currentPrice = closes[closes.length - 1];
   const rsi = calculateRSI(closes);
   const ema50 = calculateEMA(closes, 50)[closes.length - 1];
@@ -56,89 +62,77 @@ function generateMultiFactorSignal(closes) {
   let score = 0;
   const reasons = [];
 
-  if (rsi < 28) { score += 40; reasons.push("RSI Extrêmement Survente"); }
-  else if (rsi < 35) { score += 24; reasons.push("RSI Survente"); }
-  else if (rsi > 78) { score -= 42; reasons.push("RSI Extrêmement Surachat"); }
-  else if (rsi > 70) { score -= 26; reasons.push("RSI Surachat"); }
+  if (rsi <= 28) { score += 40; reasons.push("RSI Extrêmement Survente"); }
+  else if (rsi < 35) { score += 25; reasons.push("RSI Survente"); }
+  else if (rsi >= 78) { score -= 42; reasons.push("RSI Extrêmement Surachat"); }
+  else if (rsi > 70) { score -= 28; reasons.push("RSI Surachat"); }
 
-  const bullishTrend = currentPrice > ema50 && ema50 > ema200;
-  const bearishTrend = currentPrice < ema50 && ema50 < ema200;
+  const bullish = currentPrice > ema50 && ema50 > ema200;
+  const bearish = currentPrice < ema50 && ema50 < ema200;
 
-  if (bullishTrend) { score += 32; reasons.push("Tendance Haussière Forte"); }
-  if (bearishTrend) { score -= 36; reasons.push("Tendance Baissière Forte"); }
+  if (bullish) { score += 35; reasons.push("Tendance Haussière Forte"); }
+  if (bearish) { score -= 38; reasons.push("Tendance Baissière Forte"); }
 
-  const distance = ((currentPrice - ema50) / ema50) * 100;
-  if (distance < -4.5) score += 14;
-  if (distance > 4.5) score -= 14;
-
-  let signal = 'HOLD';
-  let strength = 'MOYEN';
-
-  if (score >= 50) { 
-    signal = 'BUY'; 
-    strength = score >= 68 ? 'FORT' : 'MOYEN'; 
-  } 
-  else if (score <= -46) { 
-    signal = 'SELL'; 
-    strength = score <= -64 ? 'FORT' : 'MOYEN'; 
-  }
-
-  return {
-    signal,
-    strength,
+  const data = {
+    signal: score >= 45 ? 'BUY' : score <= -40 ? 'SELL' : 'HOLD',
+    strength: score >= 65 ? 'FORT' : score <= -55 ? 'FORT' : 'MOYEN',
     rsi: Number(rsi.toFixed(2)),
     ema50: Number(ema50.toFixed(2)),
     ema200: Number(ema200.toFixed(2)),
-    reasons: reasons.slice(0, 5)
+    score: Number(score.toFixed(1)),
+    reasons
   };
+  return data;
 }
 
-// ==================== ROUTE STABLE ====================
+// ==================== ROUTE CORRIGÉE ====================
 app.get('/market', async (req, res) => {
   try {
-    let { symbol, type = 'crypto', interval = '5m' } = req.query;
+    let { symbol, type = 'crypto', interval = '15m' } = req.query;
     if (!symbol) return res.status(400).json({ error: "Symbol requis" });
 
     const cacheKey = `${type}-${symbol}-${interval}`;
     if (CACHE.has(cacheKey)) {
       const cached = CACHE.get(cacheKey);
-      if (Date.now() - cached.timestamp < CACHE_DURATION) {
-        return res.json(cached.data);
-      }
+      if (Date.now() - cached.timestamp < CACHE_DURATION) return res.json(cached.data);
     }
 
-    let yahooSymbol = symbol;
+    let closes = [];
+    let currentPrice = 0;
+    let source = '';
 
     if (type === 'crypto') {
-      const map = {
-        BTCUSDT: 'BTC-USD',
-        ETHUSDT: 'ETH-USD',
-        BNBUSDT: 'BNB-USD',
-        SOLUSDT: 'SOL-USD'
-      };
-      yahooSymbol = map[symbol] || symbol;
+      // Binance pour crypto
+      const binanceSymbol = symbol.replace('/', '').toUpperCase();
+      const response = await axios.get('https://api.binance.com/api/v3/klines', {
+        params: { symbol: binanceSymbol, interval, limit: 300 },
+        timeout: 10000
+      });
+      closes = response.data.map(c => parseFloat(c[4])).filter(p => !isNaN(p) && p > 0);
+      source = 'Binance';
+    } else {
+      // Yahoo Finance pour Forex, Commodities, Stocks
+      const yahooSymbol = symbol;
+      const response = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${yahooSymbol}`, {
+        params: { interval, range: interval === '1d' ? '60d' : '30d' },
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        timeout: 10000
+      });
+
+      const quote = response.data?.chart?.result?.[0]?.indicators?.quote?.[0];
+      closes = quote?.close?.filter(p => p && p > 0) || [];
+      source = 'Yahoo Finance';
     }
 
-    const response = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${yahooSymbol}`, {
-      params: { 
-        interval, 
-        range: interval === '1d' ? '30d' : '10d' 
-      },
-      headers: { 'User-Agent': 'Mozilla/5.0' },
-      timeout: 15000
-    });
+    if (closes.length < 100) throw new Error("Données insuffisantes");
 
-    const result = response.data?.chart?.result?.[0];
-    const closes = result?.indicators?.quote?.[0]?.close?.filter(p => p > 0) || [];
-
-    if (closes.length < 50) throw new Error(`Données insuffisantes pour ${symbol}`);
-
+    currentPrice = closes[closes.length - 1];
     const analysis = generateMultiFactorSignal(closes);
-    const currentPrice = closes[closes.length - 1];
 
     const data = {
-      symbol,
-      marketPrice: Number(currentPrice.toFixed(4)),
+      symbol: symbol.replace('=X', '').replace('=F', '').replace('^', ''),
+      marketPrice: Number(currentPrice.toFixed(2)),
+      source,
       ...analysis,
       timestamp: new Date().toISOString()
     };
@@ -147,9 +141,10 @@ app.get('/market', async (req, res) => {
     res.json(data);
 
   } catch (error) {
-    console.error(error.message);
+    console.error(`Erreur /market (${req.query.symbol}):`, error.message);
     res.status(500).json({ 
-      error: "Impossible de charger les données. Réessayez dans quelques secondes.",
+      error: "Impossible de charger les données",
+      message: error.message,
       symbol: req.query.symbol,
       type: req.query.type
     });
@@ -159,5 +154,5 @@ app.get('/market', async (req, res) => {
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Serveur stable lancé sur port ${PORT}`);
+  console.log(`🚀 Serveur lancé sur port ${PORT}`);
 });
