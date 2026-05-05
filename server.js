@@ -124,7 +124,7 @@ app.get('/market', async (req, res) => {
         // TENTATIVE 1: Binance
        // TENTATIVE 1: Binance Futures (Contourne le blocage IP US de Render)
         const binanceSym = `${baseCoin}USDT`;
-        const response = await axios.get('https://fapi.binance.com/fapi/v1/klines', {
+        const response = await axios.get('https://api.mexc.com/api/v3/klines', {
           params: { symbol: binanceSym, interval: timeConfig.binance, limit: 300 },
           timeout: 4000
         });
