@@ -8,9 +8,9 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// ==================== CACHE AMÉLIORÉ ====================
+// Cache
 const CACHE = new Map();
-const CACHE_DURATION = 8000; // Réduit à 8 secondes pour plus de réactivité
+const CACHE_DURATION = 12000;
 
 // ==================== FONCTIONS ====================
 function calculateRSI(prices, period = 14) {
@@ -93,15 +93,13 @@ function generateMultiFactorSignal(closes) {
   };
 }
 
-// ==================== ROUTE PRINCIPALE ====================
+// ==================== ROUTE STABLE ====================
 app.get('/market', async (req, res) => {
   try {
     let { symbol, type = 'crypto', interval = '5m' } = req.query;
     if (!symbol) return res.status(400).json({ error: "Symbol requis" });
 
     const cacheKey = `${type}-${symbol}-${interval}`;
-
-    // Force refresh si changement de timeframe
     if (CACHE.has(cacheKey)) {
       const cached = CACHE.get(cacheKey);
       if (Date.now() - cached.timestamp < CACHE_DURATION) {
@@ -109,38 +107,34 @@ app.get('/market', async (req, res) => {
       }
     }
 
-    let closes = [];
-    let currentPrice = 0;
+    let yahooSymbol = symbol;
 
     if (type === 'crypto') {
-      const binanceRes = await axios.get('https://api.binance.com/api/v3/klines', {
-        params: { 
-          symbol: symbol.toUpperCase(), 
-          interval, 
-          limit: interval === '1d' ? 200 : 500 
-        },
-        timeout: 10000
-      });
-      closes = binanceRes.data.map(k => parseFloat(k[4]));
-    } else {
-      let yahooSymbol = symbol;
-      const yahooRes = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${yahooSymbol}`, {
-        params: { 
-          interval, 
-          range: interval === '1d' ? '30d' : '10d' 
-        },
-        headers: { 'User-Agent': 'Mozilla/5.0' },
-        timeout: 15000
-      });
-
-      const result = yahooRes.data?.chart?.result?.[0];
-      closes = result?.indicators?.quote?.[0]?.close?.filter(p => p > 0) || [];
+      const map = {
+        BTCUSDT: 'BTC-USD',
+        ETHUSDT: 'ETH-USD',
+        BNBUSDT: 'BNB-USD',
+        SOLUSDT: 'SOL-USD'
+      };
+      yahooSymbol = map[symbol] || symbol;
     }
 
-    if (closes.length < 40) throw new Error(`Données insuffisantes pour ${interval}`);
+    const response = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${yahooSymbol}`, {
+      params: { 
+        interval, 
+        range: interval === '1d' ? '30d' : '10d' 
+      },
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      timeout: 15000
+    });
+
+    const result = response.data?.chart?.result?.[0];
+    const closes = result?.indicators?.quote?.[0]?.close?.filter(p => p > 0) || [];
+
+    if (closes.length < 50) throw new Error(`Données insuffisantes pour ${symbol}`);
 
     const analysis = generateMultiFactorSignal(closes);
-    currentPrice = closes[closes.length - 1];
+    const currentPrice = closes[closes.length - 1];
 
     const data = {
       symbol,
@@ -154,12 +148,16 @@ app.get('/market', async (req, res) => {
 
   } catch (error) {
     console.error(error.message);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ 
+      error: "Impossible de charger les données. Réessayez dans quelques secondes.",
+      symbol: req.query.symbol,
+      type: req.query.type
+    });
   }
 });
 
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Trading Server optimisé sur port ${PORT}`);
+  console.log(`🚀 Serveur stable lancé sur port ${PORT}`);
 });
