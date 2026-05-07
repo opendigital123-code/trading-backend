@@ -10,6 +10,10 @@ app.use(express.json());
 
 const CACHE = new Map();
 
+const YAHOO_HEADERS = {
+  'User-Agent': 'Mozilla/5.0'
+};
+
 const INTERVAL_MAP = {
   '1m': { binance: '1m', yahooInt: '1m', yahooRange: '5d', cache: 5000 },
   '5m': { binance: '5m', yahooInt: '5m', yahooRange: '30d', cache: 10000 },
@@ -21,7 +25,6 @@ const INTERVAL_MAP = {
   '1w': { binance: '1w', yahooInt: '1wk', yahooRange: '5y', cache: 300000 }
 };
 
-// ==================== UTILITAIRES ====================
 function round(value, digits = 4) {
   if (!Number.isFinite(value)) return 0;
   return Number(value.toFixed(digits));
@@ -54,7 +57,6 @@ function formatPrice(value) {
   return Number(value.toFixed(8)).toString();
 }
 
-// ==================== INDICATEURS TECHNIQUES ====================
 function calculateRSI(prices, period = 14) {
   if (prices.length <= period) return 50;
 
@@ -148,7 +150,7 @@ function calculateMomentum(prices, period = 5) {
   const current = prices[prices.length - 1];
   const previous = prices[prices.length - 1 - period];
 
-  return ((current - previous) / previous) * 100;
+  return previous !== 0 ? ((current - previous) / previous) * 100 : 0;
 }
 
 function calculateSupportResistance(candles, period = 30) {
@@ -160,7 +162,6 @@ function calculateSupportResistance(candles, period = 30) {
   };
 }
 
-// ==================== NEWS SENTIMENT SIMPLE ====================
 function normalizeNewsScore(news = '') {
   const text = String(news).toLowerCase();
 
@@ -189,8 +190,6 @@ function normalizeNewsScore(news = '') {
   return Math.max(-10, Math.min(10, score * 2));
 }
 
-// ==================== SIGNAL SCALPING MULTI-FACTEURS ====================
-// ==================== SIGNAL SCALPING MULTI-FACTEURS ====================
 function generateScalpingSignal(candles, options = {}) {
   const tp1Percent = 1.8;
   const tp2Percent = 3;
@@ -328,18 +327,21 @@ function generateScalpingSignal(candles, options = {}) {
   }
 
   const newsScore = normalizeNewsScore(options.news);
+
   if (newsScore !== 0) {
     score += newsScore;
     reasons.push(newsScore > 0 ? 'News sentiment positif' : 'News sentiment negatif');
   }
 
   let signal = 'HOLD';
+
   if (score >= 45) signal = 'BUY';
   else if (score <= -45) signal = 'SELL';
 
   const confidence = Math.min(95, Math.round(Math.abs(score)));
 
   let strength = 'FAIBLE';
+
   if (confidence >= 70) strength = 'FORT';
   else if (confidence >= 45) strength = 'MOYEN';
 
@@ -401,7 +403,6 @@ function generateScalpingSignal(candles, options = {}) {
     strength,
     confidence,
     score: round(score, 1),
-
     entry: formattedTradePlan.entry,
     entryZone: formattedTradePlan.entryZone,
     stopLoss: formattedTradePlan.stopLoss,
@@ -413,9 +414,7 @@ function generateScalpingSignal(candles, options = {}) {
     resistance: formattedTradePlan.resistance,
     invalidation,
     exitPlan,
-
     tradePlan: formattedTradePlan,
-
     indicators: {
       rsi7: round(rsi7, 2),
       rsi14: round(rsi14, 2),
@@ -428,11 +427,10 @@ function generateScalpingSignal(candles, options = {}) {
       volumeRatio: round(volumeRatio, 2),
       momentum5: `${round(momentum5, 3)}%`
     },
-
     reasons
   };
 }
-// ==================== FORMATAGE YAHOO ====================
+
 function yahooCandlesFromResult(result) {
   const quote = result?.indicators?.quote?.[0];
   const timestamps = result?.timestamp || [];
@@ -454,7 +452,21 @@ function yahooCandlesFromResult(result) {
   );
 }
 
-// ==================== ROUTE PRINCIPALE ====================
+app.get('/', (req, res) => {
+  res.json({
+    status: 'ok',
+    message: 'Trading backend is running',
+    endpoints: {
+      health: '/health',
+      market: '/market?symbol=BTC&type=crypto&interval=15m'
+    }
+  });
+});
+
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok' });
+});
+
 app.get('/market', async (req, res) => {
   try {
     let { symbol, type = 'crypto', interval = '15m', news = '' } = req.query;
@@ -464,6 +476,7 @@ app.get('/market', async (req, res) => {
     }
 
     symbol = symbol.toUpperCase().trim();
+    type = String(type).toLowerCase().trim();
 
     if (!INTERVAL_MAP[interval]) {
       interval = '15m';
@@ -474,6 +487,7 @@ app.get('/market', async (req, res) => {
 
     if (CACHE.has(cacheKey)) {
       const cached = CACHE.get(cacheKey);
+
       if (Date.now() - cached.timestamp < timeConfig.cache) {
         return res.json(cached.data);
       }
@@ -549,6 +563,7 @@ app.get('/market', async (req, res) => {
               interval: timeConfig.yahooInt,
               range: timeConfig.yahooRange
             },
+            headers: YAHOO_HEADERS,
             timeout: 5000
           });
 
@@ -564,6 +579,7 @@ app.get('/market', async (req, res) => {
           interval: timeConfig.yahooInt,
           range: timeConfig.yahooRange
         },
+        headers: YAHOO_HEADERS,
         timeout: 5000
       });
 
@@ -597,20 +613,15 @@ app.get('/market', async (req, res) => {
       timestamp: Date.now()
     });
 
-    res.json(data);
+    return res.json(data);
   } catch (error) {
     console.error(`Erreur /market (${req.query.symbol} - ${req.query.interval}):`, error.message);
 
-    res.status(500).json({
+    return res.status(500).json({
       error: 'Impossible de charger les donnees',
       message: 'Verifiez le symbole ou reessayez plus tard. Exemple: AAPL, EURUSD=X, BTC.'
     });
   }
-});
-
-
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok' });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
