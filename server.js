@@ -9,179 +9,610 @@ app.use(cors());
 app.use(express.json());
 
 const CACHE = new Map();
-const CACHE_DURATION = 15000; // 15 secondes
 
-// ==================== CONFIGURATION DES TIMEFRAMES ====================
-// Gère les limites strictes des API (surtout Yahoo Finance)
 const INTERVAL_MAP = {
-  '1m':  { binance: '1m',  yahooInt: '1m',  yahooRange: '5d' },  // Yahoo max 7d pour 1m
-  '5m':  { binance: '5m',  yahooInt: '5m',  yahooRange: '30d' }, // Yahoo max 60d
-  '15m': { binance: '15m', yahooInt: '15m', yahooRange: '30d' },
-  '30m': { binance: '30m', yahooInt: '30m', yahooRange: '30d' },
-  '1h':  { binance: '1h',  yahooInt: '60m', yahooRange: '60d' },
-  '4h':  { binance: '4h',  yahooInt: '60m', yahooRange: '60d' }, // Yahoo ne fait pas 4h, on triche avec 1h
-  '1d':  { binance: '1d',  yahooInt: '1d',  yahooRange: '2y' },
-  '1w':  { binance: '1w',  yahooInt: '1wk', yahooRange: '5y' }
+  '1m': { binance: '1m', yahooInt: '1m', yahooRange: '5d', cache: 5000 },
+  '5m': { binance: '5m', yahooInt: '5m', yahooRange: '30d', cache: 10000 },
+  '15m': { binance: '15m', yahooInt: '15m', yahooRange: '30d', cache: 15000 },
+  '30m': { binance: '30m', yahooInt: '30m', yahooRange: '30d', cache: 20000 },
+  '1h': { binance: '1h', yahooInt: '60m', yahooRange: '60d', cache: 30000 },
+  '4h': { binance: '4h', yahooInt: '60m', yahooRange: '60d', cache: 60000 },
+  '1d': { binance: '1d', yahooInt: '1d', yahooRange: '2y', cache: 120000 },
+  '1w': { binance: '1w', yahooInt: '1wk', yahooRange: '5y', cache: 300000 }
 };
 
-// ==================== FONCTIONS TECHNIQUES ====================
+// ==================== UTILITAIRES ====================
+function round(value, digits = 4) {
+  if (!Number.isFinite(value)) return 0;
+  return Number(value.toFixed(digits));
+}
+
+function average(values) {
+  if (!values.length) return 0;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function formatPrice(value) {
+  if (!Number.isFinite(value)) return null;
+
+  const abs = Math.abs(value);
+
+  if (abs >= 1000) {
+    return Number(value.toFixed(2)).toLocaleString('en-US', {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2
+    });
+  }
+
+  if (abs >= 1) {
+    return Number(value.toFixed(4)).toLocaleString('en-US', {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 4
+    });
+  }
+
+  return Number(value.toFixed(8)).toString();
+}
+
+// ==================== INDICATEURS TECHNIQUES ====================
 function calculateRSI(prices, period = 14) {
   if (prices.length <= period) return 50;
-  let avgGain = 0, avgLoss = 0;
+
+  let avgGain = 0;
+  let avgLoss = 0;
+
   for (let i = 1; i <= period; i++) {
     const diff = prices[i] - prices[i - 1];
-    if (diff > 0) avgGain += diff; else avgLoss += Math.abs(diff);
+    avgGain += Math.max(diff, 0);
+    avgLoss += Math.max(-diff, 0);
   }
-  avgGain /= period; avgLoss /= period;
+
+  avgGain /= period;
+  avgLoss /= period;
+
   for (let i = period + 1; i < prices.length; i++) {
     const diff = prices[i] - prices[i - 1];
     avgGain = (avgGain * (period - 1) + Math.max(diff, 0)) / period;
     avgLoss = (avgLoss * (period - 1) + Math.max(-diff, 0)) / period;
   }
-  return avgLoss === 0 ? 100 : 100 - (100 / (1 + avgGain / avgLoss));
+
+  if (avgLoss === 0) return 100;
+  return 100 - (100 / (1 + avgGain / avgLoss));
 }
 
 function calculateEMA(prices, period) {
-  if (prices.length < period) return prices[prices.length - 1] || 0;
-  let sum = prices.slice(0, period).reduce((a, b) => a + b, 0);
-  let ema = sum / period;
+  if (prices.length < period) {
+    return prices.map(() => prices[prices.length - 1] || 0);
+  }
+
+  let ema = average(prices.slice(0, period));
   const k = 2 / (period + 1);
-  const result = [...Array(period).fill(ema)];
+  const result = Array(period - 1).fill(null);
+
+  result.push(ema);
+
   for (let i = period; i < prices.length; i++) {
     ema = prices[i] * k + ema * (1 - k);
     result.push(ema);
   }
+
   return result;
 }
 
-function generateMultiFactorSignal(closes) {
-  if (closes.length < 50) return { signal: 'HOLD', strength: 'FAIBLE', rsi: 50, ema50: 0, ema200: 0, score: 0, reasons: ["Pas assez de données"] };
+function calculateATR(candles, period = 14) {
+  if (candles.length <= period) return 0;
 
-  const currentPrice = closes[closes.length - 1];
-  const rsi = calculateRSI(closes);
-  const ema50 = calculateEMA(closes, 50)[closes.length - 1];
-  const ema200 = closes.length >= 200 ? calculateEMA(closes, 200)[closes.length - 1] : currentPrice;
+  const trueRanges = [];
+
+  for (let i = 1; i < candles.length; i++) {
+    const current = candles[i];
+    const previous = candles[i - 1];
+
+    trueRanges.push(Math.max(
+      current.high - current.low,
+      Math.abs(current.high - previous.close),
+      Math.abs(current.low - previous.close)
+    ));
+  }
+
+  return average(trueRanges.slice(-period));
+}
+
+function calculateVWAP(candles, period = 30) {
+  const recent = candles.slice(-period);
+  let pv = 0;
+  let volume = 0;
+
+  for (const candle of recent) {
+    const typical = (candle.high + candle.low + candle.close) / 3;
+    pv += typical * candle.volume;
+    volume += candle.volume;
+  }
+
+  return volume > 0 ? pv / volume : recent[recent.length - 1]?.close || 0;
+}
+
+function calculateVolumeRatio(candles, period = 20) {
+  const volumes = candles.map(c => c.volume).filter(v => v > 0);
+  if (volumes.length < period + 1) return 1;
+
+  const current = volumes[volumes.length - 1];
+  const base = average(volumes.slice(-(period + 1), -1));
+
+  return base > 0 ? current / base : 1;
+}
+
+function calculateMomentum(prices, period = 5) {
+  if (prices.length <= period) return 0;
+
+  const current = prices[prices.length - 1];
+  const previous = prices[prices.length - 1 - period];
+
+  return ((current - previous) / previous) * 100;
+}
+
+function calculateSupportResistance(candles, period = 30) {
+  const recent = candles.slice(-period);
+
+  return {
+    support: Math.min(...recent.map(c => c.low)),
+    resistance: Math.max(...recent.map(c => c.high))
+  };
+}
+
+// ==================== NEWS SENTIMENT SIMPLE ====================
+function normalizeNewsScore(news = '') {
+  const text = String(news).toLowerCase();
+
+  const bullishWords = [
+    'bullish', 'breakout', 'surge', 'rally', 'upgrade', 'beat',
+    'partnership', 'approval', 'adoption', 'accumulation', 'record high',
+    'hausse', 'explosion', 'partenariat', 'adoption', 'achat'
+  ];
+
+  const bearishWords = [
+    'bearish', 'crash', 'dump', 'lawsuit', 'hack', 'ban', 'downgrade',
+    'miss', 'selloff', 'liquidation', 'fraud', 'rejection',
+    'baisse', 'chute', 'piratage', 'interdiction', 'vente'
+  ];
+
+  let score = 0;
+
+  for (const word of bullishWords) {
+    if (text.includes(word)) score += 1;
+  }
+
+  for (const word of bearishWords) {
+    if (text.includes(word)) score -= 1;
+  }
+
+  return Math.max(-10, Math.min(10, score * 2));
+}
+
+// ==================== SIGNAL SCALPING MULTI-FACTEURS ====================
+// ==================== SIGNAL SCALPING MULTI-FACTEURS ====================
+function generateScalpingSignal(candles, options = {}) {
+  const tp1Percent = 1.8;
+  const tp2Percent = 3;
+
+  if (candles.length < 60) {
+    return {
+      signal: 'HOLD',
+      strength: 'FAIBLE',
+      confidence: 0,
+      score: 0,
+      entry: null,
+      entryZone: null,
+      stopLoss: null,
+      takeProfit1: null,
+      takeProfit2: null,
+      tp1Percent,
+      tp2Percent,
+      support: null,
+      resistance: null,
+      invalidation: 'Pas assez de donnees pour definir une zone fiable',
+      exitPlan: null,
+      tradePlan: {
+        action: 'HOLD',
+        entry: null,
+        entryZone: null,
+        stopLoss: null,
+        takeProfit1: null,
+        takeProfit2: null,
+        tp1Percent,
+        tp2Percent,
+        support: null,
+        resistance: null,
+        invalidation: 'Pas assez de donnees pour definir une zone fiable',
+        exitPlan: null
+      },
+      indicators: {},
+      reasons: ['Pas assez de donnees pour un signal fiable']
+    };
+  }
+
+  const closes = candles.map(c => c.close);
+  const current = candles[candles.length - 1];
+  const previous = candles[candles.length - 2];
+  const currentPrice = current.close;
+
+  const ema9Array = calculateEMA(closes, 9);
+  const ema21Array = calculateEMA(closes, 21);
+  const ema50Array = calculateEMA(closes, 50);
+
+  const ema9 = ema9Array[ema9Array.length - 1];
+  const ema21 = ema21Array[ema21Array.length - 1];
+  const ema50 = ema50Array[ema50Array.length - 1];
+
+  const rsi7 = calculateRSI(closes, 7);
+  const rsi14 = calculateRSI(closes, 14);
+  const atr = calculateATR(candles, 14);
+  const vwap = calculateVWAP(candles, 30);
+  const volumeRatio = calculateVolumeRatio(candles, 20);
+  const momentum5 = calculateMomentum(closes, 5);
+  const { support, resistance } = calculateSupportResistance(candles, 30);
+
+  const atrPercent = atr > 0 ? (atr / currentPrice) * 100 : 0;
+  const candleBody = Math.abs(current.close - current.open);
+  const candleRange = Math.max(current.high - current.low, 0.00000001);
+  const bodyRatio = candleBody / candleRange;
 
   let score = 0;
   const reasons = [];
 
-  const bullishTrend = currentPrice > ema50 && ema50 >= ema200;
-  const bearishTrend = currentPrice < ema50 && ema50 <= ema200;
+  const bullishTrend = ema9 > ema21 && ema21 > ema50 && currentPrice > ema9;
+  const bearishTrend = ema9 < ema21 && ema21 < ema50 && currentPrice < ema9;
 
-  if (bullishTrend) { score += 30; reasons.push("Tendance Haussière (EMA)"); }
-  else if (currentPrice > ema50) { score += 10; reasons.push("Biais Haussier court terme"); }
+  if (bullishTrend) {
+    score += 26;
+    reasons.push('Tendance scalp haussiere EMA 9/21/50');
+  } else if (bearishTrend) {
+    score -= 26;
+    reasons.push('Tendance scalp baissiere EMA 9/21/50');
+  }
 
-  if (bearishTrend) { score -= 30; reasons.push("Tendance Baissière (EMA)"); }
-  else if (currentPrice < ema50) { score -= 10; reasons.push("Biais Baissier court terme"); }
+  if (currentPrice > vwap) {
+    score += 10;
+    reasons.push('Prix au-dessus du VWAP');
+  } else {
+    score -= 10;
+    reasons.push('Prix sous le VWAP');
+  }
 
-  if (rsi >= 75) { score -= 25; reasons.push("RSI Surachat (Risque de correction)"); }
-  else if (rsi > 55) { score += 15; reasons.push("Momentum Haussier (RSI)"); }
-  else if (rsi <= 25) { score += 25; reasons.push("RSI Survente (Rebond potentiel)"); }
-  else if (rsi < 45) { score -= 15; reasons.push("Momentum Baissier (RSI)"); }
+  if (rsi7 > 52 && rsi7 < 72 && rsi14 > 50) {
+    score += 16;
+    reasons.push('RSI confirme le momentum acheteur');
+  } else if (rsi7 < 48 && rsi7 > 28 && rsi14 < 50) {
+    score -= 16;
+    reasons.push('RSI confirme le momentum vendeur');
+  }
 
-  let signal = 'HOLD', strength = 'MOYEN';
-  if (score >= 40) signal = 'BUY';
-  else if (score <= -40) signal = 'SELL';
+  if (rsi7 >= 78) {
+    score -= 18;
+    reasons.push('RSI trop haut: risque de pullback');
+  } else if (rsi7 <= 22) {
+    score += 18;
+    reasons.push('RSI tres bas: rebond possible');
+  }
 
-  if (Math.abs(score) >= 55) strength = 'FORT';
-  else if (Math.abs(score) < 20) strength = 'FAIBLE';
+  if (momentum5 > 0.15) {
+    score += 10;
+    reasons.push('Momentum court terme positif');
+  } else if (momentum5 < -0.15) {
+    score -= 10;
+    reasons.push('Momentum court terme negatif');
+  }
+
+  if (volumeRatio >= 1.25) {
+    score += score >= 0 ? 10 : -10;
+    reasons.push('Volume superieur a la moyenne');
+  } else if (volumeRatio < 0.75) {
+    score *= 0.75;
+    reasons.push('Volume faible: signal reduit');
+  }
+
+  if (current.close > previous.high && bodyRatio > 0.45) {
+    score += 12;
+    reasons.push('Cassure haussiere de la bougie precedente');
+  } else if (current.close < previous.low && bodyRatio > 0.45) {
+    score -= 12;
+    reasons.push('Cassure baissiere de la bougie precedente');
+  }
+
+  if (atrPercent < 0.08) {
+    score *= 0.65;
+    reasons.push('Volatilite trop faible pour scalping');
+  } else if (atrPercent > 3.5) {
+    score *= 0.7;
+    reasons.push('Volatilite excessive: risque eleve');
+  }
+
+  const newsScore = normalizeNewsScore(options.news);
+  if (newsScore !== 0) {
+    score += newsScore;
+    reasons.push(newsScore > 0 ? 'News sentiment positif' : 'News sentiment negatif');
+  }
+
+  let signal = 'HOLD';
+  if (score >= 45) signal = 'BUY';
+  else if (score <= -45) signal = 'SELL';
+
+  const confidence = Math.min(95, Math.round(Math.abs(score)));
+
+  let strength = 'FAIBLE';
+  if (confidence >= 70) strength = 'FORT';
+  else if (confidence >= 45) strength = 'MOYEN';
+
+  const planSide = signal === 'SELL' || (signal === 'HOLD' && score < 0) ? 'SELL' : 'BUY';
+  const entry = currentPrice;
+
+  let entryZone;
+  let stopLoss;
+  let takeProfit1;
+  let takeProfit2;
+  let invalidation;
+  let exitPlan;
+
+  if (planSide === 'BUY') {
+    const entryLow = currentPrice - atr * 0.15;
+    const entryHigh = currentPrice + atr * 0.10;
+
+    entryZone = `${formatPrice(entryLow)} - ${formatPrice(entryHigh)}`;
+    stopLoss = Math.min(support, currentPrice - atr * 1.35);
+    takeProfit1 = entry * (1 + tp1Percent / 100);
+    takeProfit2 = entry * (1 + tp2Percent / 100);
+
+    invalidation = `Plan LONG invalide si le prix casse sous ${formatPrice(stopLoss)}`;
+    exitPlan = `Entree LONG autour de ${formatPrice(entry)}. TP1 a ${formatPrice(takeProfit1)} (+1.8%), TP2 a ${formatPrice(takeProfit2)} (+3%). Stop loss sous ${formatPrice(stopLoss)}.`;
+  } else {
+    const entryLow = currentPrice - atr * 0.10;
+    const entryHigh = currentPrice + atr * 0.15;
+
+    entryZone = `${formatPrice(entryLow)} - ${formatPrice(entryHigh)}`;
+    stopLoss = Math.max(resistance, currentPrice + atr * 1.35);
+    takeProfit1 = entry * (1 - tp1Percent / 100);
+    takeProfit2 = entry * (1 - tp2Percent / 100);
+
+    invalidation = `Plan SHORT invalide si le prix casse au-dessus de ${formatPrice(stopLoss)}`;
+    exitPlan = `Entree SHORT autour de ${formatPrice(entry)}. TP1 a ${formatPrice(takeProfit1)} (-1.8%), TP2 a ${formatPrice(takeProfit2)} (-3%). Stop loss au-dessus de ${formatPrice(stopLoss)}.`;
+  }
+
+  if (signal === 'HOLD') {
+    reasons.push('Signal faible: plan donne a titre indicatif, attendre confirmation avant entree');
+  }
+
+  const formattedTradePlan = {
+    action: planSide,
+    entry: formatPrice(entry),
+    entryZone,
+    stopLoss: formatPrice(stopLoss),
+    takeProfit1: formatPrice(takeProfit1),
+    takeProfit2: formatPrice(takeProfit2),
+    tp1Percent,
+    tp2Percent,
+    support: formatPrice(support),
+    resistance: formatPrice(resistance),
+    invalidation,
+    exitPlan
+  };
 
   return {
-    signal, strength,
-    rsi: Number(rsi.toFixed(2)),
-    ema50: Number(ema50.toFixed(2)),
-    ema200: Number(ema200.toFixed(2)),
-    score: Number(score.toFixed(1)),
+    signal,
+    strength,
+    confidence,
+    score: round(score, 1),
+
+    entry: formattedTradePlan.entry,
+    entryZone: formattedTradePlan.entryZone,
+    stopLoss: formattedTradePlan.stopLoss,
+    takeProfit1: formattedTradePlan.takeProfit1,
+    takeProfit2: formattedTradePlan.takeProfit2,
+    tp1Percent,
+    tp2Percent,
+    support: formattedTradePlan.support,
+    resistance: formattedTradePlan.resistance,
+    invalidation,
+    exitPlan,
+
+    tradePlan: formattedTradePlan,
+
+    indicators: {
+      rsi7: round(rsi7, 2),
+      rsi14: round(rsi14, 2),
+      ema9: formatPrice(ema9),
+      ema21: formatPrice(ema21),
+      ema50: formatPrice(ema50),
+      vwap: formatPrice(vwap),
+      atr: formatPrice(atr),
+      atrPercent: `${round(atrPercent, 3)}%`,
+      volumeRatio: round(volumeRatio, 2),
+      momentum5: `${round(momentum5, 3)}%`
+    },
+
     reasons
   };
+}
+// ==================== FORMATAGE YAHOO ====================
+function yahooCandlesFromResult(result) {
+  const quote = result?.indicators?.quote?.[0];
+  const timestamps = result?.timestamp || [];
+
+  if (!quote) return [];
+
+  return timestamps.map((timestamp, index) => ({
+    time: timestamp * 1000,
+    open: quote.open?.[index],
+    high: quote.high?.[index],
+    low: quote.low?.[index],
+    close: quote.close?.[index],
+    volume: quote.volume?.[index] || 0
+  })).filter(c =>
+    c.open > 0 &&
+    c.high > 0 &&
+    c.low > 0 &&
+    c.close > 0
+  );
 }
 
 // ==================== ROUTE PRINCIPALE ====================
 app.get('/market', async (req, res) => {
   try {
-    let { symbol, type = 'crypto', interval = '15m' } = req.query;
-    if (!symbol) return res.status(400).json({ error: "Symbol requis" });
+    let { symbol, type = 'crypto', interval = '15m', news = '' } = req.query;
 
-    // Nettoyage et vérification de l'intervalle
-    symbol = symbol.toUpperCase().trim();
-    if (!INTERVAL_MAP[interval]) interval = '1d'; // Fallback sécurisé
-    const timeConfig = INTERVAL_MAP[interval];
-
-    const cacheKey = `${type}-${symbol}-${interval}`;
-    if (CACHE.has(cacheKey)) {
-      const cached = CACHE.get(cacheKey);
-      if (Date.now() - cached.timestamp < CACHE_DURATION) return res.json(cached.data);
+    if (!symbol) {
+      return res.status(400).json({ error: 'Symbol requis' });
     }
 
-    let closes = [];
+    symbol = symbol.toUpperCase().trim();
+
+    if (!INTERVAL_MAP[interval]) {
+      interval = '15m';
+    }
+
+    const timeConfig = INTERVAL_MAP[interval];
+    const cacheKey = `${type}-${symbol}-${interval}-${String(news).slice(0, 80)}`;
+
+    if (CACHE.has(cacheKey)) {
+      const cached = CACHE.get(cacheKey);
+      if (Date.now() - cached.timestamp < timeConfig.cache) {
+        return res.json(cached.data);
+      }
+    }
+
+    let candles = [];
     let source = '';
 
     if (type === 'crypto') {
-      // Nettoyage crypto : extraire juste la monnaie de base (ex: BTC/USDT -> BTC)
       const baseCoin = symbol.replace(/[^A-Z0-9]/g, '').replace(/USDT$|USD$|EUR$/, '');
-      
+      const cryptoSymbol = `${baseCoin}USDT`;
+
       try {
-        // TENTATIVE 1: Binance
-       // TENTATIVE 1: Binance Futures (Contourne le blocage IP US de Render)
-        const binanceSym = `${baseCoin}USDT`;
-        const response = await axios.get('https://api.mexc.com/api/v3/klines', {
-          params: { symbol: binanceSym, interval: timeConfig.binance, limit: 300 },
+        const response = await axios.get('https://api.binance.com/api/v3/klines', {
+          params: {
+            symbol: cryptoSymbol,
+            interval: timeConfig.binance,
+            limit: 300
+          },
           timeout: 4000
         });
-        closes = response.data.map(c => parseFloat(c[4])).filter(p => p > 0);
+
+        candles = response.data.map(c => ({
+          time: Number(c[0]),
+          open: Number(c[1]),
+          high: Number(c[2]),
+          low: Number(c[3]),
+          close: Number(c[4]),
+          volume: Number(c[5])
+        })).filter(c =>
+          c.open > 0 &&
+          c.high > 0 &&
+          c.low > 0 &&
+          c.close > 0
+        );
+
         source = 'Binance';
-      } catch (e) {
-        console.log(`[Crypto] Binance a échoué pour ${baseCoin}, passage sur Yahoo...`);
-        // TENTATIVE 2: Yahoo Finance (Fallback parfait pour Render)
-        const yahooSym = `${baseCoin}-USD`;
-        const response = await axios.get(`https://query2.finance.yahoo.com/v8/finance/chart/${yahooSym}`, {
-          params: { interval: timeConfig.yahooInt, range: timeConfig.yahooRange },
-          timeout: 5000
-        });
-        const quote = response.data?.chart?.result?.[0]?.indicators?.quote?.[0];
-        closes = quote?.close?.filter(p => p !== null && p > 0) || [];
-        source = 'Yahoo Finance';
+      } catch (binanceError) {
+        console.log(`[Crypto] Binance a echoue pour ${cryptoSymbol}, passage sur MEXC...`);
+
+        try {
+          const response = await axios.get('https://api.mexc.com/api/v3/klines', {
+            params: {
+              symbol: cryptoSymbol,
+              interval: timeConfig.binance,
+              limit: 300
+            },
+            timeout: 4000
+          });
+
+          candles = response.data.map(c => ({
+            time: Number(c[0]),
+            open: Number(c[1]),
+            high: Number(c[2]),
+            low: Number(c[3]),
+            close: Number(c[4]),
+            volume: Number(c[5])
+          })).filter(c =>
+            c.open > 0 &&
+            c.high > 0 &&
+            c.low > 0 &&
+            c.close > 0
+          );
+
+          source = 'MEXC';
+        } catch (mexcError) {
+          console.log(`[Crypto] MEXC a echoue pour ${cryptoSymbol}, passage sur Yahoo...`);
+
+          const yahooSym = `${baseCoin}-USD`;
+
+          const response = await axios.get(`https://query2.finance.yahoo.com/v8/finance/chart/${yahooSym}`, {
+            params: {
+              interval: timeConfig.yahooInt,
+              range: timeConfig.yahooRange
+            },
+            timeout: 5000
+          });
+
+          const result = response.data?.chart?.result?.[0];
+
+          candles = yahooCandlesFromResult(result);
+          source = 'Yahoo Finance';
+        }
       }
     } else {
-      // FINANCE TRADITIONNELLE (Forex, Stocks, Commodities)
       const response = await axios.get(`https://query2.finance.yahoo.com/v8/finance/chart/${symbol}`, {
-        params: { interval: timeConfig.yahooInt, range: timeConfig.yahooRange },
+        params: {
+          interval: timeConfig.yahooInt,
+          range: timeConfig.yahooRange
+        },
         timeout: 5000
       });
-      const quote = response.data?.chart?.result?.[0]?.indicators?.quote?.[0];
-      closes = quote?.close?.filter(p => p !== null && p > 0) || [];
+
+      const result = response.data?.chart?.result?.[0];
+
+      candles = yahooCandlesFromResult(result);
       source = 'Yahoo Finance';
     }
 
-    if (!closes || closes.length < 20) {
-      return res.status(404).json({ error: "Données introuvables ou timeframe non supporté pour cet actif." });
+    if (!candles || candles.length < 60) {
+      return res.status(404).json({
+        error: 'Donnees insuffisantes ou timeframe non supporte pour cet actif.'
+      });
     }
 
-    const currentPrice = closes[closes.length - 1];
-    const analysis = generateMultiFactorSignal(closes);
+    const currentPrice = candles[candles.length - 1].close;
+    const analysis = generateScalpingSignal(candles, { news });
 
     const data = {
-      symbol: symbol,
-      marketPrice: Number(currentPrice.toFixed(4)),
+      symbol,
+      type,
+      interval,
+      marketPrice: formatPrice(currentPrice),
       source,
       ...analysis,
       timestamp: new Date().toISOString()
     };
 
-    CACHE.set(cacheKey, { data, timestamp: Date.now() });
-    res.json(data);
+    CACHE.set(cacheKey, {
+      data,
+      timestamp: Date.now()
+    });
 
+    res.json(data);
   } catch (error) {
     console.error(`Erreur /market (${req.query.symbol} - ${req.query.interval}):`, error.message);
-    res.status(500).json({ 
-      error: "Impossible de charger les données",
-      message: "Vérifiez le symbole (ex: AAPL, EURUSD=X, BTC). L'API peut être temporairement bloquée."
+
+    res.status(500).json({
+      error: 'Impossible de charger les donnees',
+      message: 'Verifiez le symbole ou reessayez plus tard. Exemple: AAPL, EURUSD=X, BTC.'
     });
   }
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
+
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok' });
+});
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Serveur lancé sur le port ${PORT}`);
+  console.log(`Serveur lance sur le port ${PORT}`);
 });
