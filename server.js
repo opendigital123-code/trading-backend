@@ -1,6 +1,7 @@
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
+const TWELVE_API_KEY = process.env.TWELVE_API_KEY || '134818b4120c4258a581c132d18177ca';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -469,13 +470,20 @@ app.get('/health', (req, res) => {
 
 app.get('/market', async (req, res) => {
   try {
-    let { symbol, type = 'crypto', interval = '15m', news = '' } = req.query;
+let tdSymbol = symbol;
 
-    if (!symbol) {
-      return res.status(400).json({ error: 'Symbol requis' });
-    }
-
-    symbol = symbol.toUpperCase().trim();
+const tdResponse = await axios.get(
+  'https://api.twelvedata.com/time_series',
+  {
+    params: {
+      symbol: tdSymbol,
+      interval: tdIntervalMap[interval] || '15min',
+      outputsize: 300,
+      apikey: TWELVE_API_KEY
+    },
+    timeout: 5000
+  }
+);
     type = String(type).toLowerCase().trim();
 
     if (!INTERVAL_MAP[interval]) {
@@ -607,31 +615,94 @@ app.get('/market', async (req, res) => {
         }
       }
 
-    } else {
-
       // =========================
       // FOREX / STOCKS / COMMODITIES
       // =========================
 
-      const response = await axios.get(
-        `https://query2.finance.yahoo.com/v8/finance/chart/${symbol}`,
-        {
-          params: {
-            interval: timeConfig.yahooInt,
-            range: timeConfig.yahooRange
-          },
-          headers: YAHOO_HEADERS,
-          timeout: 5000
-        }
-      );
+     } else {
 
-      const result = response.data?.chart?.result?.[0];
+  try {
 
-      candles = yahooCandlesFromResult(result);
+    const tdIntervalMap = {
+      '1m': '1min',
+      '5m': '5min',
+      '15m': '15min',
+      '30m': '30min',
+      '1h': '1h',
+      '4h': '4h',
+      '1d': '1day',
+      '1w': '1week'
+    };
 
-      source = 'Yahoo Finance';
+    let tdSymbol = symbol;
+
+    // ===== CONVERSION INDICES =====
+
+    const tdResponse = await axios.get(
+      'https://api.twelvedata.com/time_series',
+      {
+        params: {
+          symbol: tdSymbol,
+          interval: tdIntervalMap[interval] || '15min',
+          outputsize: 300,
+          apikey: TWELVE_API_KEY
+        },
+        timeout: 5000
+      }
+    );
+
+    if (
+      tdResponse.data &&
+      tdResponse.data.values &&
+      Array.isArray(tdResponse.data.values)
+    ) {
+
+      candles = tdResponse.data.values
+        .map(c => ({
+          time: new Date(c.datetime).getTime(),
+          open: Number(c.open),
+          high: Number(c.high),
+          low: Number(c.low),
+          close: Number(c.close),
+          volume: Number(c.volume || 0)
+        }))
+        .reverse()
+        .filter(c =>
+          c.open > 0 &&
+          c.high > 0 &&
+          c.low > 0 &&
+          c.close > 0
+        );
+
+      source = 'TwelveData';
+
+    } else {
+      throw new Error('TwelveData invalid response');
     }
 
+  } catch (tdError) {
+
+    console.log(`[TwelveData] Echec pour ${symbol}, fallback Yahoo`);
+
+    const response = await axios.get(
+      `https://query2.finance.yahoo.com/v8/finance/chart/${symbol}`,
+      {
+        params: {
+          interval: timeConfig.yahooInt,
+          range: timeConfig.yahooRange
+        },
+        headers: YAHOO_HEADERS,
+        timeout: 5000
+      }
+    );
+
+    const result = response.data?.chart?.result?.[0];
+
+    candles = yahooCandlesFromResult(result);
+
+    source = 'Yahoo Finance';
+  }
+}
     // =========================
     // VALIDATION
     // =========================
@@ -667,14 +738,13 @@ if (type === 'crypto') {
       }
     );
 
-    const livePrice = Number(tickerResponse.data.price);
-
     if (Number.isFinite(livePrice) && livePrice > 0) {
       currentPrice = livePrice;
 
       // IMPORTANT :
       // on synchronise aussi la derniere bougie
       candles[candles.length - 1].close = livePrice;
+        console.log("PRIX LIVE BINANCE:", livePrice);
     }
 
   } catch (tickerError) {
