@@ -1,32 +1,135 @@
+require('dotenv').config({ quiet: true });
+
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
 
-const TWELVE_API_KEY =
-  process.env.TWELVE_API_KEY ||
-  '134818b4120c4258a581c132d18177ca';
-
 const app = express();
 const PORT = process.env.PORT || 3000;
+const HOST = process.env.HOST || '0.0.0.0';
 
-app.use(cors());
+app.set('trust proxy', 1);
+app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
 app.use(express.json());
 
 const CACHE = new Map();
+const AXIOS_TIMEOUT = Number(process.env.MARKET_TIMEOUT_MS || 8000);
 
-const YAHOO_HEADERS = {
-  'User-Agent': 'Mozilla/5.0'
-};
+const HTTP = axios.create({
+  timeout: AXIOS_TIMEOUT,
+  headers: {
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+      '(KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+    Accept: 'application/json,text/plain,*/*'
+  }
+});
 
 const INTERVAL_MAP = {
-  '1m': { binance: '1m', yahooInt: '1m', yahooRange: '5d', cache: 5000 },
-  '5m': { binance: '5m', yahooInt: '5m', yahooRange: '30d', cache: 10000 },
-  '15m': { binance: '15m', yahooInt: '15m', yahooRange: '30d', cache: 15000 },
-  '30m': { binance: '30m', yahooInt: '30m', yahooRange: '30d', cache: 20000 },
-  '1h': { binance: '1h', yahooInt: '60m', yahooRange: '60d', cache: 30000 },
-  '4h': { binance: '4h', yahooInt: '60m', yahooRange: '60d', cache: 60000 },
-  '1d': { binance: '1d', yahooInt: '1d', yahooRange: '2y', cache: 120000 },
-  '1w': { binance: '1w', yahooInt: '1wk', yahooRange: '5y', cache: 300000 }
+  '1m': {
+    binance: '1m',
+    bybit: '1',
+    yahooInt: '1m',
+    yahooRange: '5d',
+    coinbaseGranularity: 60,
+    bitstampStep: 60,
+    cache: 5000
+  },
+  '5m': {
+    binance: '5m',
+    bybit: '5',
+    yahooInt: '5m',
+    yahooRange: '30d',
+    coinbaseGranularity: 300,
+    bitstampStep: 300,
+    cache: 10000
+  },
+  '15m': {
+    binance: '15m',
+    bybit: '15',
+    yahooInt: '15m',
+    yahooRange: '30d',
+    coinbaseGranularity: 900,
+    bitstampStep: 900,
+    cache: 15000
+  },
+  '30m': {
+    binance: '30m',
+    bybit: '30',
+    yahooInt: '30m',
+    yahooRange: '60d',
+    coinbaseGranularity: null,
+    bitstampStep: 1800,
+    cache: 20000
+  },
+  '1h': {
+    binance: '1h',
+    bybit: '60',
+    yahooInt: '60m',
+    yahooRange: '60d',
+    coinbaseGranularity: 3600,
+    bitstampStep: 3600,
+    cache: 30000
+  },
+  '4h': {
+    binance: '4h',
+    bybit: '240',
+    yahooInt: '60m',
+    yahooRange: '60d',
+    coinbaseGranularity: 21600,
+    bitstampStep: 14400,
+    aggregateMs: 4 * 60 * 60 * 1000,
+    cache: 60000
+  },
+  '1d': {
+    binance: '1d',
+    bybit: 'D',
+    yahooInt: '1d',
+    yahooRange: '2y',
+    coinbaseGranularity: 86400,
+    bitstampStep: 86400,
+    cache: 120000
+  },
+  '1w': {
+    binance: '1w',
+    bybit: 'W',
+    yahooInt: '1wk',
+    yahooRange: '5y',
+    coinbaseGranularity: null,
+    bitstampStep: 86400,
+    bitstampAggregateMs: 7 * 24 * 60 * 60 * 1000,
+    cache: 300000
+  }
+};
+
+const YAHOO_SYMBOL_ALIASES = {
+  US100: '^NDX',
+  NAS100: '^NDX',
+  NASDAQ100: '^NDX',
+  NDX100: '^NDX',
+  USTECH100: '^NDX',
+  USTEC: '^NDX',
+  TECH100: '^NDX',
+  'US TECH 100': '^NDX',
+  'NASDAQ 100': '^NDX',
+  NQ: 'NQ=F',
+  NQF: 'NQ=F',
+  SPX500: 'ES=F',
+  US500: 'ES=F',
+  SP500: 'ES=F',
+  US30: 'YM=F',
+  DJI: 'YM=F',
+  DJ30: 'YM=F',
+  GER40: '^GDAXI',
+  DAX40: '^GDAXI',
+  UK100: '^FTSE',
+  XAUUSD: 'GC=F',
+  GOLD: 'GC=F',
+  XAGUSD: 'SI=F',
+  SILVER: 'SI=F',
+  USOIL: 'CL=F',
+  WTI: 'CL=F',
+  BRENT: 'BZ=F'
 };
 
 function round(value, digits = 4) {
@@ -35,8 +138,16 @@ function round(value, digits = 4) {
 }
 
 function average(values) {
-  if (!values.length) return 0;
-  return values.reduce((sum, value) => sum + value, 0) / values.length;
+  const valid = values.filter(Number.isFinite);
+  if (!valid.length) return 0;
+  return valid.reduce((sum, value) => sum + value, 0) / valid.length;
+}
+
+function median(values) {
+  const valid = values.filter(Number.isFinite).sort((a, b) => a - b);
+  if (!valid.length) return 0;
+  const mid = Math.floor(valid.length / 2);
+  return valid.length % 2 ? valid[mid] : (valid[mid - 1] + valid[mid]) / 2;
 }
 
 function formatPrice(value) {
@@ -77,7 +188,7 @@ function calculateRSI(prices, period = 14) {
   }
 
   if (avgLoss === 0) return 100;
-  return 100 - (100 / (1 + avgGain / avgLoss));
+  return 100 - 100 / (1 + avgGain / avgLoss);
 }
 
 function calculateEMA(prices, period) {
@@ -97,6 +208,22 @@ function calculateEMA(prices, period) {
   }
 
   return result;
+}
+
+function calculateMACD(prices) {
+  const ema12 = calculateEMA(prices, 12);
+  const ema26 = calculateEMA(prices, 26);
+  const macdLine = prices.map((_, i) => {
+    if (!Number.isFinite(ema12[i]) || !Number.isFinite(ema26[i])) return null;
+    return ema12[i] - ema26[i];
+  });
+  const signalLine = calculateEMA(macdLine.filter(Number.isFinite), 9);
+
+  return {
+    macd: macdLine.at(-1) || 0,
+    signal: signalLine.at(-1) || 0,
+    histogram: (macdLine.at(-1) || 0) - (signalLine.at(-1) || 0)
+  };
 }
 
 function calculateATR(candles, period = 14) {
@@ -155,7 +282,7 @@ function calculateMomentum(prices, period = 5) {
   return previous ? ((current - previous) / previous) * 100 : 0;
 }
 
-function calculateSupportResistance(candles, period = 30) {
+function calculateSupportResistance(candles, period = 40) {
   const recent = candles.slice(-period);
 
   return {
@@ -167,15 +294,456 @@ function calculateSupportResistance(candles, period = 30) {
 function normalizeNewsScore(news = '') {
   const text = String(news).toLowerCase();
 
-  const bull = ['bullish','breakout','surge','rally','upgrade','adoption'];
-  const bear = ['bearish','crash','dump','lawsuit','hack','ban'];
+  const bull = ['bullish', 'breakout', 'surge', 'rally', 'upgrade', 'adoption'];
+  const bear = ['bearish', 'crash', 'dump', 'lawsuit', 'hack', 'ban'];
 
   let score = 0;
 
   for (const w of bull) if (text.includes(w)) score++;
   for (const w of bear) if (text.includes(w)) score--;
 
-  return Math.max(-10, Math.min(10, score * 2));
+  return Math.max(-8, Math.min(8, score * 2));
+}
+
+function strengthFromConfidence(confidence) {
+  if (confidence >= 70) return 'FORTE';
+  if (confidence >= 45) return 'MOYENNE';
+  return 'FAIBLE';
+}
+
+function priceDigits(value) {
+  const abs = Math.abs(Number(value));
+
+  if (abs >= 1000) return 2;
+  if (abs >= 1) return 4;
+  return 8;
+}
+
+function formatPlanPrice(value, reference) {
+  const ref = Number.isFinite(reference) ? reference : value;
+  return round(value, priceDigits(ref));
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function createScalpingTradePlan({
+  signal,
+  score,
+  price,
+  atr,
+  support,
+  resistance
+}) {
+  const direction = signal === 'SELL' || (signal === 'HOLD' && score < 0) ? 'SELL' : 'BUY';
+  const isBuy = direction === 'BUY';
+  const usableAtr = Number.isFinite(atr) && atr > 0 ? atr : price * 0.002;
+  const minRisk = price * 0.0006;
+  const maxRisk = price * 0.006;
+  const baseRisk = clamp(usableAtr * 0.65, minRisk, maxRisk);
+  let risk = baseRisk;
+
+  if (isBuy && Number.isFinite(support) && support > 0 && support < price) {
+    const supportRisk = price - support;
+    if (supportRisk <= baseRisk * 1.5) risk = Math.max(baseRisk, supportRisk + baseRisk * 0.12);
+  }
+
+  if (!isBuy && Number.isFinite(resistance) && resistance > price) {
+    const resistanceRisk = resistance - price;
+    if (resistanceRisk <= baseRisk * 1.5) risk = Math.max(baseRisk, resistanceRisk + baseRisk * 0.12);
+  }
+
+  const entry = price;
+  const entryPad = clamp(usableAtr * 0.12, price * 0.00015, price * 0.0012);
+  const stopLoss = isBuy ? entry - risk : entry + risk;
+  const takeProfit1 = isBuy ? entry + risk * 0.85 : entry - risk * 0.85;
+  const takeProfit2 = isBuy ? entry + risk * 1.45 : entry - risk * 1.45;
+  const entryLow = isBuy ? entry - entryPad : entry + entryPad;
+  const entryHigh = isBuy ? entry + entryPad : entry - entryPad;
+  const safeSupport =
+    Number.isFinite(support) && support > 0 ? support : isBuy ? stopLoss : takeProfit2;
+  const safeResistance =
+    Number.isFinite(resistance) && resistance > 0 ? resistance : isBuy ? takeProfit2 : stopLoss;
+  const action = signal === 'HOLD' ? `WAIT_${direction}` : direction;
+
+  return {
+    action,
+    entry: formatPlanPrice(entry, price),
+    entryZone: `${formatPlanPrice(Math.min(entryLow, entryHigh), price)} - ${formatPlanPrice(Math.max(entryLow, entryHigh), price)}`,
+    stopLoss: formatPlanPrice(stopLoss, price),
+    sl: formatPlanPrice(stopLoss, price),
+    takeProfit1: formatPlanPrice(takeProfit1, price),
+    takeProfit2: formatPlanPrice(takeProfit2, price),
+    tp1: formatPlanPrice(takeProfit1, price),
+    tp2: formatPlanPrice(takeProfit2, price),
+    takeProfit: [
+      formatPlanPrice(takeProfit1, price),
+      formatPlanPrice(takeProfit2, price)
+    ],
+    targets: [
+      formatPlanPrice(takeProfit1, price),
+      formatPlanPrice(takeProfit2, price)
+    ],
+    support: formatPlanPrice(safeSupport, price),
+    resistance: formatPlanPrice(safeResistance, price),
+    invalidation: formatPlanPrice(stopLoss, price),
+    riskReward: {
+      tp1: round(Math.abs(takeProfit1 - entry) / Math.abs(entry - stopLoss), 2),
+      tp2: round(Math.abs(takeProfit2 - entry) / Math.abs(entry - stopLoss), 2)
+    },
+    exitPlan:
+      'Scalping: securiser a TP1, remonter le SL vers entry, sortir vite si la bougie casse le momentum.'
+  };
+}
+
+function normalizeCandles(candles) {
+  return candles
+    .map(c => ({
+      time: Number(c.time),
+      open: Number(c.open),
+      high: Number(c.high),
+      low: Number(c.low),
+      close: Number(c.close),
+      volume: Number(c.volume || 0)
+    }))
+    .filter(
+      c =>
+        Number.isFinite(c.time) &&
+        Number.isFinite(c.open) &&
+        Number.isFinite(c.high) &&
+        Number.isFinite(c.low) &&
+        Number.isFinite(c.close) &&
+        c.open > 0 &&
+        c.high > 0 &&
+        c.low > 0 &&
+        c.close > 0
+    )
+    .sort((a, b) => a.time - b.time);
+}
+
+function applyCurrentPrice(candles, currentPrice) {
+  if (!candles.length || !Number.isFinite(currentPrice) || currentPrice <= 0) {
+    return candles;
+  }
+
+  const updated = candles.map(c => ({ ...c }));
+  const last = updated.at(-1);
+  last.close = currentPrice;
+  last.high = Math.max(last.high, currentPrice);
+  last.low = Math.min(last.low, currentPrice);
+  return updated;
+}
+
+function aggregateCandles(candles, bucketMs) {
+  if (!bucketMs) return candles;
+
+  const grouped = new Map();
+
+  for (const candle of candles) {
+    const bucket = Math.floor(candle.time / bucketMs) * bucketMs;
+    const current = grouped.get(bucket);
+
+    if (!current) {
+      grouped.set(bucket, { ...candle, time: bucket });
+      continue;
+    }
+
+    current.high = Math.max(current.high, candle.high);
+    current.low = Math.min(current.low, candle.low);
+    current.close = candle.close;
+    current.volume += candle.volume || 0;
+  }
+
+  return [...grouped.values()].sort((a, b) => a.time - b.time);
+}
+
+function splitTradingViewSymbol(rawSymbol) {
+  const raw = String(rawSymbol || '').trim();
+  const parts = raw.split(':');
+
+  if (parts.length > 1) {
+    return {
+      exchange: parts[0].toLowerCase(),
+      symbol: parts.slice(1).join(':')
+    };
+  }
+
+  return { exchange: '', symbol: raw };
+}
+
+function compactSymbol(symbol) {
+  return String(symbol || '')
+    .toUpperCase()
+    .trim()
+    .replace(/\s+/g, ' ')
+    .replace(/\.P$/, '')
+    .replace(/PERP$/, '');
+}
+
+function normalizeCryptoPair(rawSymbol) {
+  const { exchange, symbol } = splitTradingViewSymbol(rawSymbol);
+  const cleaned = compactSymbol(symbol)
+    .replace(/[-/_\s]/g, '')
+    .replace(/[^A-Z0-9]/g, '');
+
+  const quotes = ['USDT', 'USDC', 'BUSD', 'USD', 'EUR', 'BTC', 'ETH'];
+  const quote = quotes.find(q => cleaned.endsWith(q) && cleaned.length > q.length);
+  const base = quote ? cleaned.slice(0, -quote.length) : cleaned;
+  const stableQuote = quote && quote !== 'USD' ? quote : 'USDT';
+
+  return {
+    exchange,
+    base,
+    quote: quote || 'USDT',
+    binanceSymbol: `${base}${stableQuote}`,
+    bybitSymbol: `${base}${stableQuote}`,
+    coinbaseProduct: `${base}-${quote === 'EUR' ? 'EUR' : 'USD'}`,
+    bitstampPair: `${base}${quote === 'EUR' ? 'EUR' : 'USD'}`.toLowerCase()
+  };
+}
+
+function resolveYahooSymbol(rawSymbol, type) {
+  const { symbol } = splitTradingViewSymbol(rawSymbol);
+  const normalized = compactSymbol(symbol);
+  const aliasKey = normalized.replace(/[-/_^=.\s]/g, '');
+
+  if (YAHOO_SYMBOL_ALIASES[normalized]) return YAHOO_SYMBOL_ALIASES[normalized];
+  if (YAHOO_SYMBOL_ALIASES[aliasKey]) return YAHOO_SYMBOL_ALIASES[aliasKey];
+  if (normalized.includes('=') || normalized.startsWith('^')) return normalized;
+
+  const compact = normalized.replace(/[-/_\s]/g, '');
+  if (type === 'forex' && /^[A-Z]{6}$/.test(compact)) return `${compact}=X`;
+
+  return normalized;
+}
+
+function providerOrder(provider, exchange) {
+  const preferred = String(provider || exchange || '').toLowerCase();
+
+  if (preferred.includes('coinbase')) return ['coinbase', 'binance', 'bybit'];
+  if (preferred.includes('bitstamp')) return ['bitstamp', 'coinbase', 'binance', 'bybit'];
+  if (preferred.includes('bybit')) return ['bybit', 'binance', 'coinbase'];
+  if (preferred.includes('yahoo')) return ['yahoo'];
+
+  return ['binance', 'bybit', 'coinbase'];
+}
+
+async function fetchBinanceCrypto(pair, timeConfig) {
+  const [klinesResponse, tickerResponse] = await Promise.all([
+    HTTP.get('https://api.binance.com/api/v3/klines', {
+      params: {
+        symbol: pair.binanceSymbol,
+        interval: timeConfig.binance,
+        limit: 500
+      }
+    }),
+    HTTP.get('https://api.binance.com/api/v3/ticker/price', {
+      params: { symbol: pair.binanceSymbol }
+    }).catch(() => null)
+  ]);
+
+  const candles = normalizeCandles(
+    klinesResponse.data.map(c => ({
+      time: c[0],
+      open: c[1],
+      high: c[2],
+      low: c[3],
+      close: c[4],
+      volume: c[5]
+    }))
+  );
+
+  const currentPrice = Number(tickerResponse?.data?.price);
+
+  return {
+    candles: applyCurrentPrice(candles, currentPrice),
+    currentPrice,
+    source: `Binance Spot (${pair.binanceSymbol})`
+  };
+}
+
+async function fetchBybitCrypto(pair, timeConfig) {
+  const response = await HTTP.get('https://api.bybit.com/v5/market/kline', {
+    params: {
+      category: 'spot',
+      symbol: pair.bybitSymbol,
+      interval: timeConfig.bybit,
+      limit: 500
+    }
+  });
+
+  if (response.data?.retCode !== 0) {
+    throw new Error(response.data?.retMsg || 'Bybit error');
+  }
+
+  const candles = normalizeCandles(
+    (response.data?.result?.list || []).map(c => ({
+      time: c[0],
+      open: c[1],
+      high: c[2],
+      low: c[3],
+      close: c[4],
+      volume: c[5]
+    }))
+  );
+
+  return {
+    candles,
+    currentPrice: candles.at(-1)?.close,
+    source: `Bybit Spot (${pair.bybitSymbol})`
+  };
+}
+
+async function fetchCoinbaseCrypto(pair, timeConfig) {
+  if (!timeConfig.coinbaseGranularity) {
+    throw new Error('Intervalle non supporte par Coinbase');
+  }
+
+  const end = Math.floor(Date.now() / 1000);
+  const start = end - timeConfig.coinbaseGranularity * 300;
+  const [response, tickerResponse] = await Promise.all([
+    HTTP.get(
+      `https://api.exchange.coinbase.com/products/${pair.coinbaseProduct}/candles`,
+      {
+        params: {
+          start: new Date(start * 1000).toISOString(),
+          end: new Date(end * 1000).toISOString(),
+          granularity: timeConfig.coinbaseGranularity
+        }
+      }
+    ),
+    HTTP.get(`https://api.exchange.coinbase.com/products/${pair.coinbaseProduct}/ticker`).catch(() => null)
+  ]);
+
+  const candles = normalizeCandles(
+    response.data.map(c => ({
+      time: c[0] * 1000,
+      low: c[1],
+      high: c[2],
+      open: c[3],
+      close: c[4],
+      volume: c[5]
+    }))
+  );
+
+  const currentPrice = Number(tickerResponse?.data?.price);
+
+  return {
+    candles: applyCurrentPrice(candles, currentPrice),
+    currentPrice,
+    source: `Coinbase Exchange (${pair.coinbaseProduct})`
+  };
+}
+
+async function fetchBitstampCrypto(pair, timeConfig) {
+  if (!timeConfig.bitstampStep) {
+    throw new Error('Intervalle non supporte par Bitstamp');
+  }
+
+  const [ohlcResponse, tickerResponse] = await Promise.all([
+    HTTP.get(`https://www.bitstamp.net/api/v2/ohlc/${pair.bitstampPair}/`, {
+      params: {
+        step: timeConfig.bitstampStep,
+        limit: 1000
+      }
+    }),
+    HTTP.get(`https://www.bitstamp.net/api/v2/ticker/${pair.bitstampPair}/`).catch(() => null)
+  ]);
+
+  let candles = normalizeCandles(
+    (ohlcResponse.data?.data?.ohlc || []).map(c => ({
+      time: Number(c.timestamp) * 1000,
+      open: c.open,
+      high: c.high,
+      low: c.low,
+      close: c.close,
+      volume: c.volume
+    }))
+  );
+
+  candles = aggregateCandles(candles, timeConfig.bitstampAggregateMs);
+
+  const currentPrice = Number(tickerResponse?.data?.last);
+
+  return {
+    candles: applyCurrentPrice(candles, currentPrice),
+    currentPrice,
+    source: `Bitstamp (${pair.bitstampPair.toUpperCase()})`
+  };
+}
+
+async function fetchYahooMarket(rawSymbol, type, timeConfig) {
+  const yahooSymbol = resolveYahooSymbol(rawSymbol, type);
+  const response = await HTTP.get(
+    `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}`,
+    {
+      params: {
+        interval: timeConfig.yahooInt,
+        range: timeConfig.yahooRange,
+        includePrePost: true,
+        events: 'history'
+      }
+    }
+  );
+
+  const result = response.data?.chart?.result?.[0];
+  const error = response.data?.chart?.error;
+  if (!result || error) {
+    throw new Error(error?.description || 'Yahoo Finance error');
+  }
+
+  const quote = result?.indicators?.quote?.[0];
+  const timestamps = result?.timestamp || [];
+  if (!quote) throw new Error('Yahoo Finance quote vide');
+
+  let candles = normalizeCandles(
+    timestamps.map((t, i) => ({
+      time: t * 1000,
+      open: quote.open?.[i],
+      high: quote.high?.[i],
+      low: quote.low?.[i],
+      close: quote.close?.[i],
+      volume: quote.volume?.[i] || 0
+    }))
+  );
+
+  candles = aggregateCandles(candles, timeConfig.aggregateMs);
+
+  const currentPrice = Number(result?.meta?.regularMarketPrice);
+
+  return {
+    candles: applyCurrentPrice(candles, currentPrice),
+    currentPrice,
+    source: `Yahoo Finance (${yahooSymbol})`
+  };
+}
+
+async function fetchCryptoMarket(rawSymbol, timeConfig, provider) {
+  const pair = normalizeCryptoPair(rawSymbol);
+  const attempts = providerOrder(provider, pair.exchange);
+  const errors = [];
+
+  for (const attempt of attempts) {
+    try {
+      if (attempt === 'bitstamp') return await fetchBitstampCrypto(pair, timeConfig);
+      if (attempt === 'binance') return await fetchBinanceCrypto(pair, timeConfig);
+      if (attempt === 'bybit') return await fetchBybitCrypto(pair, timeConfig);
+      if (attempt === 'coinbase') return await fetchCoinbaseCrypto(pair, timeConfig);
+    } catch (error) {
+      errors.push(`${attempt}: ${error.message}`);
+    }
+  }
+
+  throw new Error(errors.join(' | ') || 'Aucune source crypto disponible');
+}
+
+async function fetchMarketData({ symbol, type, timeConfig, provider }) {
+  if (type === 'crypto') {
+    return fetchCryptoMarket(symbol, timeConfig, provider);
+  }
+
+  return fetchYahooMarket(symbol, type, timeConfig);
 }
 
 function generateScalpingSignal(candles, options = {}) {
@@ -190,68 +758,125 @@ function generateScalpingSignal(candles, options = {}) {
   }
 
   const closes = candles.map(c => c.close);
-  const price = candles.at(-1).close;
+  const last = candles.at(-1);
+  const previous = candles.at(-2);
+  const price = last.close;
 
   const ema9 = calculateEMA(closes, 9).at(-1);
   const ema21 = calculateEMA(closes, 21).at(-1);
   const ema50 = calculateEMA(closes, 50).at(-1);
+  const ema200 = calculateEMA(closes, 200).at(-1);
 
   const rsi7 = calculateRSI(closes, 7);
   const rsi14 = calculateRSI(closes, 14);
-
+  const macd = calculateMACD(closes);
+  const atr = calculateATR(candles, 14);
+  const atrPercent = price ? (atr / price) * 100 : 0;
   const vwap = calculateVWAP(candles, 30);
+  const volumeRatio = calculateVolumeRatio(candles, 20);
   const momentum = calculateMomentum(closes, 5);
-
+  const momentumThreshold = Math.max(0.08, Math.min(0.35, atrPercent * 0.2));
   const { support, resistance } = calculateSupportResistance(candles);
+  const range = Math.max(resistance - support, atr || 0);
+  const nearSupport = range ? (price - support) / range : 0.5;
+  const nearResistance = range ? (resistance - price) / range : 0.5;
 
   let score = 0;
   const reasons = [];
 
   if (ema9 > ema21 && ema21 > ema50) {
-    score += 25;
-    reasons.push('Tendance haussiere');
+    score += 22;
+    reasons.push('Tendance courte haussiere');
+  } else if (ema9 < ema21 && ema21 < ema50) {
+    score -= 22;
+    reasons.push('Tendance courte baissiere');
   }
 
-  if (price > vwap) score += 10;
-  if (rsi7 > 52) score += 10;
-  if (momentum > 0.15) score += 10;
+  if (Number.isFinite(ema200) && price > ema200) {
+    score += 8;
+  } else if (Number.isFinite(ema200) && price < ema200) {
+    score -= 8;
+  }
+
+  if (price > vwap) score += 9;
+  if (price < vwap) score -= 9;
+
+  if (macd.histogram > 0 && macd.macd > macd.signal) {
+    score += 10;
+    reasons.push('MACD positif');
+  } else if (macd.histogram < 0 && macd.macd < macd.signal) {
+    score -= 10;
+    reasons.push('MACD negatif');
+  }
+
+  if (rsi14 >= 55 && rsi14 <= 70) score += 9;
+  if (rsi14 <= 45 && rsi14 >= 30) score -= 9;
+  if (rsi7 > 74) score -= 7;
+  if (rsi7 < 26) score += 7;
+
+  if (momentum > momentumThreshold) {
+    score += 10;
+    reasons.push('Momentum acheteur');
+  } else if (momentum < -momentumThreshold) {
+    score -= 10;
+    reasons.push('Momentum vendeur');
+  }
+
+  if (volumeRatio > 1.15 && last.close > last.open) score += 5;
+  if (volumeRatio > 1.15 && last.close < last.open) score -= 5;
+
+  if (nearSupport < 0.18 && price > previous.close) score += 5;
+  if (nearResistance < 0.18 && price < previous.close) score -= 5;
+
+  if (atrPercent > 4) {
+    score *= 0.85;
+    reasons.push('Volatilite elevee');
+  }
 
   score += normalizeNewsScore(options.news);
 
+  const confidence = Math.min(95, Math.round(Math.abs(score)));
   let signal = 'HOLD';
-  if (score >= 45) signal = 'BUY';
-  if (score <= -45) signal = 'SELL';
+
+  if (score >= 34 && confidence >= 34) signal = 'BUY';
+  if (score <= -34 && confidence >= 34) signal = 'SELL';
+
+  if (!reasons.length) reasons.push('Marche neutre ou signaux contradictoires');
+
+  const tradePlan = createScalpingTradePlan({
+    signal,
+    score,
+    price,
+    atr,
+    support,
+    resistance
+  });
 
   return {
     signal,
-    confidence: Math.min(95, Math.abs(score)),
+    strength: strengthFromConfidence(confidence),
+    confidence,
     score: round(score, 1),
+    tradePlan,
     indicators: {
       rsi7: round(rsi7, 2),
       rsi14: round(rsi14, 2),
+      ema9: formatPrice(ema9),
+      ema21: formatPrice(ema21),
       ema50: formatPrice(ema50),
+      ema200: formatPrice(ema200),
+      macd: round(macd.macd, 6),
+      macdSignal: round(macd.signal, 6),
+      atr: formatPrice(atr),
+      atrPercent: round(atrPercent, 2),
       vwap: formatPrice(vwap),
+      volumeRatio: round(volumeRatio, 2),
+      momentum: round(momentum, 3),
       support: formatPrice(support),
       resistance: formatPrice(resistance)
     },
     reasons
   };
-}
-
-function yahooCandlesFromResult(result) {
-  const quote = result?.indicators?.quote?.[0];
-  const timestamps = result?.timestamp || [];
-
-  if (!quote) return [];
-
-  return timestamps.map((t, i) => ({
-    time: t * 1000,
-    open: quote.open[i],
-    high: quote.high[i],
-    low: quote.low[i],
-    close: quote.close[i],
-    volume: quote.volume[i] || 0
-  })).filter(c => c.close);
 }
 
 // ================= ROOT
@@ -263,32 +888,40 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok' });
+  res.json({
+    status: 'ok',
+    uptime: round(process.uptime(), 2),
+    timestamp: new Date().toISOString()
+  });
 });
 
-// ================= MARKET ROUTE (CORRIGÉE)
+// ================= MARKET ROUTE
 app.get('/market', async (req, res) => {
   try {
     let {
       symbol,
       type = 'crypto',
       interval = '15m',
-      news = ''
+      news = '',
+      provider = ''
     } = req.query;
 
     if (!symbol) {
       return res.status(400).json({ error: 'Symbol requis' });
     }
 
-    symbol = symbol.toUpperCase().trim();
+    symbol = String(symbol).trim();
     type = String(type).toLowerCase().trim();
+
+    if (type === 'indice') type = 'index';
+    if (type === 'indices') type = 'index';
 
     if (!INTERVAL_MAP[interval]) {
       interval = '15m';
     }
 
     const timeConfig = INTERVAL_MAP[interval];
-    const cacheKey = `${type}-${symbol}-${interval}`;
+    const cacheKey = `${type}-${symbol}-${interval}-${provider}`;
 
     if (CACHE.has(cacheKey)) {
       const cached = CACHE.get(cacheKey);
@@ -297,51 +930,37 @@ app.get('/market', async (req, res) => {
       }
     }
 
-    let candles = [];
-    let source = '';
+    const market = await fetchMarketData({
+      symbol,
+      type,
+      timeConfig,
+      provider
+    });
 
-    // ===== CRYPTO
-    if (type === 'crypto') {
-      let cryptoSymbol = `${symbol.replace(/[^A-Z]/g, '')}USDT`;
-
-      const response = await axios.get(
-        'https://api.binance.com/api/v3/klines',
-        {
-          params: { symbol: cryptoSymbol, interval: timeConfig.binance, limit: 300 }
-        }
-      );
-
-      candles = response.data.map(c => ({
-        time: c[0],
-        open: +c[1],
-        high: +c[2],
-        low: +c[3],
-        close: +c[4],
-        volume: +c[5]
-      }));
-
-      source = 'Binance';
+    if (!market.candles || market.candles.length < 60) {
+      return res.status(404).json({
+        error: 'Donnees insuffisantes',
+        source: market.source,
+        candles: market.candles?.length || 0
+      });
     }
 
-    if (candles.length < 60) {
-      return res.status(404).json({ error: 'Donnees insuffisantes' });
-    }
-if (!candles || candles.length === 0) {
-  return res.status(404).json({
-    error: 'Aucune donnée disponible'
-  });
-}
-    const currentPrice = candles.at(-1).close;
+    const closes = market.candles.map(c => c.close);
+    const currentPrice =
+      Number.isFinite(market.currentPrice) && market.currentPrice > 0
+        ? market.currentPrice
+        : median(closes.slice(-3));
 
+    const candles = applyCurrentPrice(market.candles, currentPrice);
     const analysis = generateScalpingSignal(candles, { news });
 
     const data = {
-      symbol,
+      symbol: compactSymbol(symbol),
       type,
       interval,
       marketPrice: currentPrice,
       formattedPrice: formatPrice(currentPrice),
-      source,
+      source: market.source,
       ...analysis,
       timestamp: new Date().toISOString()
     };
@@ -349,13 +968,18 @@ if (!candles || candles.length === 0) {
     CACHE.set(cacheKey, { data, timestamp: Date.now() });
 
     return res.json(data);
-
   } catch (error) {
-    console.error(error.message);
-    return res.status(500).json({ error: 'Impossible de charger les donnees' });
+    console.error('Market error:', error.message);
+    return res.status(502).json({
+      error: 'Impossible de charger les donnees',
+      details:
+        process.env.NODE_ENV === 'production'
+          ? undefined
+          : error.message
+    });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Serveur lance sur port ${PORT}`);
+app.listen(PORT, HOST, () => {
+  console.log(`Serveur lance sur ${HOST}:${PORT}`);
 });
