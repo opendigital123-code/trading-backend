@@ -483,6 +483,7 @@ app.get('/market', async (req, res) => {
     }
 
     const timeConfig = INTERVAL_MAP[interval];
+
     const cacheKey = `${type}-${symbol}-${interval}-${String(news).slice(0, 80)}`;
 
     if (CACHE.has(cacheKey)) {
@@ -496,19 +497,35 @@ app.get('/market', async (req, res) => {
     let candles = [];
     let source = '';
 
+    // =========================
+    // CRYPTO → BINANCE PRIORITE
+    // =========================
+
     if (type === 'crypto') {
-      const baseCoin = symbol.replace(/[^A-Z0-9]/g, '').replace(/USDT$|USD$|EUR$/, '');
-      const cryptoSymbol = `${baseCoin}USDT`;
+
+      let cryptoSymbol = symbol
+        .replace('/', '')
+        .replace('-', '')
+        .replace('USDT', '')
+        .replace('USD', '');
+
+      cryptoSymbol = `${cryptoSymbol}USDT`;
 
       try {
-        const response = await axios.get('https://api.binance.com/api/v3/klines', {
-          params: {
-            symbol: cryptoSymbol,
-            interval: timeConfig.binance,
-            limit: 300
-          },
-          timeout: 4000
-        });
+
+        // ===== PRIX BINANCE TEMPS REEL =====
+
+        const response = await axios.get(
+          'https://api.binance.com/api/v3/klines',
+          {
+            params: {
+              symbol: cryptoSymbol,
+              interval: timeConfig.binance,
+              limit: 300
+            },
+            timeout: 5000
+          }
+        );
 
         candles = response.data.map(c => ({
           time: Number(c[0]),
@@ -525,18 +542,26 @@ app.get('/market', async (req, res) => {
         );
 
         source = 'Binance';
+
       } catch (binanceError) {
-        console.log(`[Crypto] Binance a echoue pour ${cryptoSymbol}, passage sur MEXC...`);
+
+        console.log(`[CRYPTO] Binance indisponible pour ${cryptoSymbol}`);
+
+        // ===== FALLBACK MEXC =====
 
         try {
-          const response = await axios.get('https://api.mexc.com/api/v3/klines', {
-            params: {
-              symbol: cryptoSymbol,
-              interval: timeConfig.binance,
-              limit: 300
-            },
-            timeout: 4000
-          });
+
+          const response = await axios.get(
+            'https://api.mexc.com/api/v3/klines',
+            {
+              params: {
+                symbol: cryptoSymbol,
+                interval: timeConfig.binance,
+                limit: 300
+              },
+              timeout: 5000
+            }
+          );
 
           candles = response.data.map(c => ({
             time: Number(c[0]),
@@ -553,41 +578,63 @@ app.get('/market', async (req, res) => {
           );
 
           source = 'MEXC';
+
         } catch (mexcError) {
-          console.log(`[Crypto] MEXC a echoue pour ${cryptoSymbol}, passage sur Yahoo...`);
 
-          const yahooSym = `${baseCoin}-USD`;
+          console.log(`[CRYPTO] MEXC indisponible pour ${cryptoSymbol}`);
 
-          const response = await axios.get(`https://query2.finance.yahoo.com/v8/finance/chart/${yahooSym}`, {
-            params: {
-              interval: timeConfig.yahooInt,
-              range: timeConfig.yahooRange
-            },
-            headers: YAHOO_HEADERS,
-            timeout: 5000
-          });
+          // ===== FALLBACK YAHOO =====
+
+          const yahooSym = cryptoSymbol.replace('USDT', '-USD');
+
+          const response = await axios.get(
+            `https://query2.finance.yahoo.com/v8/finance/chart/${yahooSym}`,
+            {
+              params: {
+                interval: timeConfig.yahooInt,
+                range: timeConfig.yahooRange
+              },
+              headers: YAHOO_HEADERS,
+              timeout: 5000
+            }
+          );
 
           const result = response.data?.chart?.result?.[0];
 
           candles = yahooCandlesFromResult(result);
+
           source = 'Yahoo Finance';
         }
       }
+
     } else {
-      const response = await axios.get(`https://query2.finance.yahoo.com/v8/finance/chart/${symbol}`, {
-        params: {
-          interval: timeConfig.yahooInt,
-          range: timeConfig.yahooRange
-        },
-        headers: YAHOO_HEADERS,
-        timeout: 5000
-      });
+
+      // =========================
+      // FOREX / STOCKS / COMMODITIES
+      // =========================
+
+      const response = await axios.get(
+        `https://query2.finance.yahoo.com/v8/finance/chart/${symbol}`,
+        {
+          params: {
+            interval: timeConfig.yahooInt,
+            range: timeConfig.yahooRange
+          },
+          headers: YAHOO_HEADERS,
+          timeout: 5000
+        }
+      );
 
       const result = response.data?.chart?.result?.[0];
 
       candles = yahooCandlesFromResult(result);
+
       source = 'Yahoo Finance';
     }
+
+    // =========================
+    // VALIDATION
+    // =========================
 
     if (!candles || candles.length < 60) {
       return res.status(404).json({
@@ -595,16 +642,67 @@ app.get('/market', async (req, res) => {
       });
     }
 
-    const currentPrice = candles[candles.length - 1].close;
+   let currentPrice = Number(candles[candles.length - 1].close);
+
+// ===== PRIX LIVE BINANCE =====
+
+if (type === 'crypto') {
+  try {
+
+    let cryptoSymbol = symbol
+      .replace('/', '')
+      .replace('-', '')
+      .replace('USDT', '')
+      .replace('USD', '');
+
+    cryptoSymbol = `${cryptoSymbol}USDT`;
+
+    const tickerResponse = await axios.get(
+      'https://api.binance.com/api/v3/ticker/price',
+      {
+        params: {
+          symbol: cryptoSymbol
+        },
+        timeout: 3000
+      }
+    );
+
+    const livePrice = Number(tickerResponse.data.price);
+
+    if (Number.isFinite(livePrice) && livePrice > 0) {
+      currentPrice = livePrice;
+
+      // IMPORTANT :
+      // on synchronise aussi la derniere bougie
+      candles[candles.length - 1].close = livePrice;
+    }
+
+  } catch (tickerError) {
+    console.log('Impossible de recuperer le prix live Binance');
+  }
+}
+
     const analysis = generateScalpingSignal(candles, { news });
+
+    // =========================
+    // REPONSE
+    // =========================
 
     const data = {
       symbol,
       type,
       interval,
-      marketPrice: formatPrice(currentPrice),
+
+      // IMPORTANT :
+      // on garde le vrai prix brut
+      marketPrice: currentPrice,
+
+      formattedPrice: formatPrice(currentPrice),
+
       source,
+
       ...analysis,
+
       timestamp: new Date().toISOString()
     };
 
@@ -614,12 +712,17 @@ app.get('/market', async (req, res) => {
     });
 
     return res.json(data);
+
   } catch (error) {
-    console.error(`Erreur /market (${req.query.symbol} - ${req.query.interval}):`, error.message);
+
+    console.error(
+      `Erreur /market (${req.query.symbol} - ${req.query.interval}):`,
+      error.message
+    );
 
     return res.status(500).json({
       error: 'Impossible de charger les donnees',
-      message: 'Verifiez le symbole ou reessayez plus tard. Exemple: AAPL, EURUSD=X, BTC.'
+      message: 'Verifiez le symbole ou reessayez plus tard.'
     });
   }
 });
