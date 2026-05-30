@@ -1,1327 +1,1244 @@
-import express from "express";
-import path from "path";
-import fs from "fs";
-import cors from "cors";
-import compression from "compression";
-import axios from "axios";
-import { rateLimit } from "express-rate-limit";
+require('dotenv').config({ quiet: true });
+
+const express = require('express');
+const axios = require('axios');
+const cors = require('cors');
 
 const app = express();
-const PORT = 3000;
-const HOST = "0.0.0.0";
+const PORT = process.env.PORT || 3000;
+const HOST = process.env.HOST || '0.0.0.0';
 
-app.set("trust proxy", 1);
-
-// ============================================================
-// CONFIGURATION DE SECURITE & MIDDLEWARES
-// ============================================================
-const corsOrigin = process.env.CORS_ORIGIN || "*";
-app.use(cors({
-  origin: corsOrigin,
-  methods: ["GET", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"]
-}));
-
+app.set('trust proxy', 1);
+app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
 app.use(express.json());
-app.use(compression());
 
-const AXIOS_TIMEOUT = Number(process.env.MARKET_TIMEOUT_MS || 12000);
-const HTTP = axios.create({ timeout: AXIOS_TIMEOUT });
+const CACHE = new Map();
+const SIGNAL_LOCKS = new Map();
+const AXIOS_TIMEOUT = Number(process.env.MARKET_TIMEOUT_MS || 8000);
+const SIGNAL_COOLDOWN_MS = 3 * 60 * 1000;
 
-// User-Agents rotatifs pour éviter le blocage par les serveurs tiers
-const USER_AGENTS = [
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
-];
-let uaIndex = 0;
-HTTP.interceptors.request.use(config => {
-  if (config.headers) {
-    config.headers["User-Agent"] = USER_AGENTS[uaIndex % USER_AGENTS.length];
-    config.headers["Accept"] = "application/json,text/plain,*/*";
+const HTTP = axios.create({
+  timeout: AXIOS_TIMEOUT,
+  headers: {
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+      '(KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+    Accept: 'application/json,text/plain,*/*'
   }
-  uaIndex++;
-  return config;
 });
 
-// Limiteur de requêtes pour protéger l'API /api/market
-app.use("/api/market", rateLimit({
-  windowMs: 60 * 1000,
-  max: Number(process.env.RATE_LIMIT_MAX || 60),
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: "Trop de requêtes — réessayez dans une minute." }
-}));
-
-// ============================================================
-// CONFIGURATION DES INTERVALLES & CONFIGS TECHNIQUES
-// ============================================================
 const INTERVAL_MAP = {
-  "1m":  { binance: "1m",  bybit: "15",  yahooInt: "1m",  yahooRange: "5d",   coinbaseGranularity: 60,    bitstampStep: 60,    cache: 10000 },
-  "5m":  { binance: "5m",  bybit: "5",   yahooInt: "5m",  yahooRange: "15d",  coinbaseGranularity: 300,   bitstampStep: 300,   cache: 15000 },
-  "15m": { binance: "15m", bybit: "15",  yahooInt: "15m", yahooRange: "30d",  coinbaseGranularity: 900,   bitstampStep: 900,   cache: 20000 },
-  "30m": { binance: "30m", bybit: "30",  yahooInt: "30m", yahooRange: "30d",  coinbaseGranularity: null,  bitstampStep: 1800,  cache: 30000 },
-  "1h":  { binance: "1h",  bybit: "60",  yahooInt: "60m", yahooRange: "60d",  coinbaseGranularity: 3600,  bitstampStep: 3600,  cache: 40000 },
-  "4h":  { binance: "4h",  bybit: "240", yahooInt: "60m", yahooRange: "60d",  coinbaseGranularity: 21600, bitstampStep: 14400, aggregateMs: 4 * 60 * 60 * 1000, cache: 60000 },
-  "1d":  { binance: "1d",  bybit: "D",   yahooInt: "1d",  yahooRange: "1y",   coinbaseGranularity: 86400, bitstampStep: 86400, cache: 120000 },
+  '1m': {
+    intervalMs: 60 * 1000,
+    binance: '1m',
+    bybit: '1',
+    yahooInt: '1m',
+    yahooRange: '5d',
+    coinbaseGranularity: 60,
+    bitstampStep: 60,
+    cache: 5000
+  },
+  '5m': {
+    intervalMs: 5 * 60 * 1000,
+    binance: '5m',
+    bybit: '5',
+    yahooInt: '5m',
+    yahooRange: '30d',
+    coinbaseGranularity: 300,
+    bitstampStep: 300,
+    cache: 10000
+  },
+  '15m': {
+    intervalMs: 15 * 60 * 1000,
+    binance: '15m',
+    bybit: '15',
+    yahooInt: '15m',
+    yahooRange: '30d',
+    coinbaseGranularity: 900,
+    bitstampStep: 900,
+    cache: 15000
+  },
+  '30m': {
+    intervalMs: 30 * 60 * 1000,
+    binance: '30m',
+    bybit: '30',
+    yahooInt: '30m',
+    yahooRange: '60d',
+    coinbaseGranularity: null,
+    bitstampStep: 1800,
+    cache: 20000
+  },
+  '1h': {
+    intervalMs: 60 * 60 * 1000,
+    binance: '1h',
+    bybit: '60',
+    yahooInt: '60m',
+    yahooRange: '60d',
+    coinbaseGranularity: 3600,
+    bitstampStep: 3600,
+    cache: 30000
+  },
+  '4h': {
+    intervalMs: 4 * 60 * 60 * 1000,
+    binance: '4h',
+    bybit: '240',
+    yahooInt: '60m',
+    yahooRange: '60d',
+    coinbaseGranularity: 21600,
+    bitstampStep: 14400,
+    aggregateMs: 4 * 60 * 60 * 1000,
+    cache: 60000
+  },
+  '1d': {
+    intervalMs: 24 * 60 * 60 * 1000,
+    binance: '1d',
+    bybit: 'D',
+    yahooInt: '1d',
+    yahooRange: '2y',
+    coinbaseGranularity: 86400,
+    bitstampStep: 86400,
+    cache: 120000
+  },
+  '1w': {
+    intervalMs: 7 * 24 * 60 * 60 * 1000,
+    binance: '1w',
+    bybit: 'W',
+    yahooInt: '1wk',
+    yahooRange: '5y',
+    coinbaseGranularity: null,
+    bitstampStep: 86400,
+    bitstampAggregateMs: 7 * 24 * 60 * 60 * 1000,
+    cache: 300000
+  }
 };
 
 const YAHOO_SYMBOL_ALIASES = {
-  US100: "^NDX", NAS100: "^NDX", NASDAQ100: "^NDX", NDX100: "^NDX",
-  USTECH100: "^NDX", USTEC: "^NDX", TECH100: "^NDX",
-  "US TECH 100": "^NDX", "NASDAQ 100": "^NDX",
-  NQ: "NQ=F", NQF: "NQ=F", SPX500: "ES=F", US500: "ES=F",
-  SP500: "ES=F", US30: "YM=F", DJI: "YM=F", DJ30: "YM=F",
-  GER40: "^GDAXI", DAX40: "^GDAXI", UK100: "^FTSE",
-  XAUUSD: "GC=F", GOLD: "GC=F", XAGUSD: "SI=F", SILVER: "SI=F",
-  USOIL: "CL=F", WTI: "CL=F", BRENT: "BZ=F"
+  US100: '^NDX',
+  NAS100: '^NDX',
+  NASDAQ100: '^NDX',
+  NDX100: '^NDX',
+  USTECH100: '^NDX',
+  USTEC: '^NDX',
+  TECH100: '^NDX',
+  'US TECH 100': '^NDX',
+  'NASDAQ 100': '^NDX',
+  NQ: 'NQ=F',
+  NQF: 'NQ=F',
+  SPX500: 'ES=F',
+  US500: 'ES=F',
+  SP500: 'ES=F',
+  US30: 'YM=F',
+  DJI: 'YM=F',
+  DJ30: 'YM=F',
+  GER40: '^GDAXI',
+  DAX40: '^GDAXI',
+  UK100: '^FTSE',
+  XAUUSD: 'GC=F',
+  GOLD: 'GC=F',
+  XAGUSD: 'SI=F',
+  SILVER: 'SI=F',
+  USOIL: 'CL=F',
+  WTI: 'CL=F',
+  BRENT: 'BZ=F'
 };
 
-// ============================================================
-// SYSTEME DE LOCK POUR LE SIGNAL ET LE PLAN DE TRADING
-// ============================================================
-const SIGNAL_LOCK_MS = Number(process.env.SIGNAL_LOCK_MS || 3 * 60 * 1000);
-const LOCKS_DUMP_FILE = process.env.LOCKS_DUMP_FILE || path.join("/tmp", ".signal_locks_ts.json");
-
-const SIGNAL_LOCKS = new Map();
-
-function dumpLocks() {
-  try {
-    const now = Date.now();
-    const active = [];
-    for (const [key, lock] of SIGNAL_LOCKS.entries()) {
-      if (now <= lock.expiresAt) active.push([key, lock]);
-    }
-    fs.writeFileSync(LOCKS_DUMP_FILE, JSON.stringify(active), "utf8");
-  } catch (_) {}
-}
-
-function loadLocks() {
-  try {
-    if (!fs.existsSync(LOCKS_DUMP_FILE)) return;
-    const data = JSON.parse(fs.readFileSync(LOCKS_DUMP_FILE, "utf8"));
-    const now = Date.now();
-    for (const [key, lock] of data) {
-      if (lock.expiresAt > now) SIGNAL_LOCKS.set(key, lock);
-    }
-    fs.unlinkSync(LOCKS_DUMP_FILE);
-    console.log(`[locks] ${SIGNAL_LOCKS.size} signal(s) rechargé(s) depuis le dump.`);
-  } catch (_) {}
-}
-
-loadLocks();
-process.on("SIGTERM", () => { dumpLocks(); process.exit(0); });
-process.on("SIGINT",  () => { dumpLocks(); process.exit(0); });
-
-function getLockedSignal(key) {
-  const lock = SIGNAL_LOCKS.get(key);
-  if (!lock) return null;
-  if (Date.now() > lock.expiresAt) {
-    SIGNAL_LOCKS.delete(key);
-    return null;
-  }
-  return lock;
-}
-
-// ============================================================
-// SYSTEME DE CACHE LRU POUR LES CANDELESTICKS
-// ============================================================
-class LRUCache {
-  constructor(maxSize) {
-    this.maxSize = maxSize;
-    this.map = new Map();
-  }
-  get(key) { return this.map.get(key); }
-  has(key) { return this.map.has(key); }
-  set(key, value) {
-    if (this.map.has(key)) this.map.delete(key);
-    this.map.set(key, value);
-    if (this.map.size > this.maxSize) {
-      const firstKey = this.map.keys().next().value;
-      if (firstKey !== undefined) this.map.delete(firstKey);
-    }
-  }
-  get size() { return this.map.size; }
-}
-
-const CACHE = new LRUCache(200);
-
-// ============================================================
-// UTILITIES MATHEMATIQUES ET CHANDELIERS
-// ============================================================
 function round(value, digits = 4) {
   if (!Number.isFinite(value)) return 0;
   return Number(value.toFixed(digits));
 }
+
 function average(values) {
   const valid = values.filter(Number.isFinite);
   if (!valid.length) return 0;
-  return valid.reduce((s, v) => s + v, 0) / valid.length;
+  return valid.reduce((sum, value) => sum + value, 0) / valid.length;
 }
+
 function median(values) {
   const valid = values.filter(Number.isFinite).sort((a, b) => a - b);
   if (!valid.length) return 0;
   const mid = Math.floor(valid.length / 2);
   return valid.length % 2 ? valid[mid] : (valid[mid - 1] + valid[mid]) / 2;
 }
-function stdDev(values) {
-  const valid = values.filter(Number.isFinite);
-  if (valid.length < 2) return 0;
-  const mean = average(valid);
-  return Math.sqrt(valid.reduce((s, v) => s + (v - mean) ** 2, 0) / valid.length);
-}
-function clamp(value, min, max) {
-  return Math.min(max, Math.max(min, value));
-}
+
 function formatPrice(value) {
+  if (!Number.isFinite(value)) return null;
+
   const abs = Math.abs(value);
-  if (abs >= 1000) return Number(value.toFixed(2)).toLocaleString("en-US");
-  if (abs >= 1)    return Number(value.toFixed(4)).toLocaleString("en-US");
+
+  if (abs >= 1000) {
+    return Number(value.toFixed(2)).toLocaleString('en-US');
+  }
+
+  if (abs >= 1) {
+    return Number(value.toFixed(4)).toLocaleString('en-US');
+  }
+
   return Number(value.toFixed(8)).toString();
 }
-function priceDigits(value) {
-  const abs = Math.abs(value);
-  if (abs >= 1000) return 2;
-  if (abs >= 1)    return 4;
-  return 8;
-}
-function formatPlanPrice(value, reference) {
-  const ref = Number.isFinite(reference) ? reference : value;
-  return round(value, priceDigits(ref)).toString();
-}
 
-// INDICATEURS TECHNIQUES
 function calculateRSI(prices, period = 14) {
   if (prices.length <= period) return 50;
-  let avgGain = 0, avgLoss = 0;
+
+  let avgGain = 0;
+  let avgLoss = 0;
+
   for (let i = 1; i <= period; i++) {
     const diff = prices[i] - prices[i - 1];
     avgGain += Math.max(diff, 0);
     avgLoss += Math.max(-diff, 0);
   }
+
   avgGain /= period;
   avgLoss /= period;
+
   for (let i = period + 1; i < prices.length; i++) {
     const diff = prices[i] - prices[i - 1];
     avgGain = (avgGain * (period - 1) + Math.max(diff, 0)) / period;
     avgLoss = (avgLoss * (period - 1) + Math.max(-diff, 0)) / period;
   }
+
   if (avgLoss === 0) return 100;
   return 100 - 100 / (1 + avgGain / avgLoss);
-}
-
-function calculateRSISeries(prices, period = 14) {
-  const result = new Array(prices.length).fill(null);
-  if (prices.length <= period) return result;
-  let avgGain = 0, avgLoss = 0;
-  for (let i = 1; i <= period; i++) {
-    const diff = prices[i] - prices[i - 1];
-    avgGain += Math.max(diff, 0);
-    avgLoss += Math.max(-diff, 0);
-  }
-  avgGain /= period;
-  avgLoss /= period;
-  result[period] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
-  for (let i = period + 1; i < prices.length; i++) {
-    const diff = prices[i] - prices[i - 1];
-    avgGain = (avgGain * (period - 1) + Math.max(diff, 0)) / period;
-    avgLoss = (avgLoss * (period - 1) + Math.max(-diff, 0)) / period;
-    result[i] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
-  }
-  return result;
-}
-
-function calculateStochRSI(prices, rsiPeriod = 14, stochPeriod = 14, kSmooth = 3, dSmooth = 3) {
-  const rsiSeries = calculateRSISeries(prices, rsiPeriod);
-  const validRsi = rsiSeries.filter(v => v !== null);
-  if (validRsi.length < stochPeriod) return { k: 50, d: 50, kPrev: 50, dPrev: 50 };
-  const stochSeries = [];
-  for (let i = stochPeriod - 1; i < validRsi.length; i++) {
-    const window = validRsi.slice(i - stochPeriod + 1, i + 1);
-    const lo = Math.min(...window), hi = Math.max(...window);
-    stochSeries.push(hi === lo ? 50 : ((validRsi[i] - lo) / (hi - lo)) * 100);
-  }
-  const kSeries = [];
-  for (let i = kSmooth - 1; i < stochSeries.length; i++) {
-    kSeries.push(average(stochSeries.slice(i - kSmooth + 1, i + 1)));
-  }
-  const dSeries = [];
-  for (let i = dSmooth - 1; i < kSeries.length; i++) {
-    dSeries.push(average(kSeries.slice(i - dSmooth + 1, i + 1)));
-  }
-  return {
-    k:     kSeries[kSeries.length - 1] ?? 50,
-    d:     dSeries[dSeries.length - 1] ?? 50,
-    kPrev: kSeries[kSeries.length - 2] ?? 50,
-    dPrev: dSeries[dSeries.length - 2] ?? 50
-  };
 }
 
 function calculateEMA(prices, period) {
   if (prices.length < period) {
     return prices.map(() => prices[prices.length - 1] || 0);
   }
+
   let ema = average(prices.slice(0, period));
   const k = 2 / (period + 1);
-  const result = Array(period - 1).fill(0);
+
+  const result = Array(period - 1).fill(null);
   result.push(ema);
+
   for (let i = period; i < prices.length; i++) {
     ema = prices[i] * k + ema * (1 - k);
     result.push(ema);
   }
+
   return result;
 }
 
-function calculateMACD(prices, fast = 12, slow = 26, signal = 9) {
-  const emaFast = calculateEMA(prices, fast);
-  const emaSlow = calculateEMA(prices, slow);
+function calculateMACD(prices) {
+  const ema12 = calculateEMA(prices, 12);
+  const ema26 = calculateEMA(prices, 26);
   const macdLine = prices.map((_, i) => {
-    if (!Number.isFinite(emaFast[i]) || !Number.isFinite(emaSlow[i])) return 0;
-    return emaFast[i] - emaSlow[i];
+    if (!Number.isFinite(ema12[i]) || !Number.isFinite(ema26[i])) return null;
+    return ema12[i] - ema26[i];
   });
-  const validMacd = macdLine.slice(slow);
-  if (validMacd.length < signal) {
-    return { macd: 0, signal: 0, histogram: 0, prevHistogram: 0, bullCross: false, bearCross: false };
-  }
-  const signalLine = calculateEMA(validMacd, signal);
-  const lastMacd = macdLine[macdLine.length - 1] ?? 0;
-  const lastSig = signalLine[signalLine.length - 1] ?? 0;
-  const prevMacd = macdLine[macdLine.length - 2] ?? 0;
-  const prevSigVal = signalLine[signalLine.length - 2] ?? 0;
-  const bullCross = prevMacd <= prevSigVal && lastMacd > lastSig;
-  const bearCross = prevMacd >= prevSigVal && lastMacd < lastSig;
-  return { macd: lastMacd, signal: lastSig, histogram: lastMacd - lastSig, prevHistogram: prevMacd - prevSigVal, bullCross, bearCross };
+  const signalLine = calculateEMA(macdLine.filter(Number.isFinite), 9);
+
+  return {
+    macd: macdLine.at(-1) || 0,
+    signal: signalLine.at(-1) || 0,
+    histogram: (macdLine.at(-1) || 0) - (signalLine.at(-1) || 0)
+  };
 }
 
 function calculateATR(candles, period = 14) {
   if (candles.length <= period) return 0;
-  const tr = [];
-  for (let i = 1; i < candles.length; i++) {
-    const c = candles[i], p = candles[i - 1];
-    tr.push(Math.max(c.high - c.low, Math.abs(c.high - p.close), Math.abs(c.low - p.close)));
-  }
-  return average(tr.slice(-period));
-}
 
-function calculateBollingerBands(prices, period = 20, multiplier = 2) {
-  if (prices.length < period) {
-    const last = prices[prices.length - 1] || 0;
-    return { upper: last, middle: last, lower: last, width: 0, percentB: 0.5, std: 0 };
+  const tr = [];
+
+  for (let i = 1; i < candles.length; i++) {
+    const c = candles[i];
+    const p = candles[i - 1];
+
+    tr.push(
+      Math.max(
+        c.high - c.low,
+        Math.abs(c.high - p.close),
+        Math.abs(c.low - p.close)
+      )
+    );
   }
-  const recent = prices.slice(-period);
-  const middle = average(recent);
-  const std = stdDev(recent);
-  const upper = middle + multiplier * std;
-  const lower = middle - multiplier * std;
-  const width = upper - lower;
-  const price = prices[prices.length - 1] ?? 0;
-  const percentB = width > 0 ? (price - lower) / width : 0.5;
-  return { upper, middle, lower, width, percentB, std };
+
+  return average(tr.slice(-period));
 }
 
 function calculateVWAP(candles, period = 30) {
   const recent = candles.slice(-period);
-  let pv = 0, vol = 0;
-  const typicals = [];
+
+  let pv = 0;
+  let vol = 0;
+
   for (const c of recent) {
     const typical = (c.high + c.low + c.close) / 3;
     pv += typical * c.volume;
     vol += c.volume;
-    typicals.push(typical);
   }
-  const vwap = vol > 0 ? pv / vol : recent[recent.length - 1]?.close || 0;
-  const variance = vol > 0
-    ? recent.reduce((s, c, i) => s + c.volume * (typicals[i] - vwap) ** 2, 0) / vol
-    : 0;
-  const std = Math.sqrt(variance);
-  return { vwap, upper1: vwap + std, lower1: vwap - std, upper2: vwap + 2 * std, lower2: vwap - 2 * std };
+
+  return vol > 0 ? pv / vol : recent.at(-1)?.close || 0;
 }
 
-function calculateSupportResistance(candles, lookback = 60, swingStrength = 3) {
-  const recent = candles.slice(-lookback);
-  const swingHighs = [], swingLows = [];
-  for (let i = swingStrength; i < recent.length - swingStrength; i++) {
-    const pivot = recent[i];
-    const isHigh = recent.slice(i - swingStrength, i + swingStrength + 1).every((c, j) => j === swingStrength || c.high <= pivot.high);
-    const isLow  = recent.slice(i - swingStrength, i + swingStrength + 1).every((c, j) => j === swingStrength || c.low  >= pivot.low);
-    if (isHigh) swingHighs.push(pivot.high);
-    if (isLow)  swingLows.push(pivot.low);
-  }
-  const price = candles[candles.length - 1]?.close ?? 0;
-  const resistances = swingHighs.filter(h => h > price).sort((a, b) => a - b);
-  const supports = swingLows.filter(l => l < price).sort((a, b) => b - a);
+function calculateVolumeRatio(candles, period = 20) {
+  const vols = candles.map(c => c.volume);
+
+  if (vols.length < period + 1) return 1;
+
+  const current = vols.at(-1);
+  const base = average(vols.slice(-(period + 1), -1));
+
+  return base > 0 ? current / base : 1;
+}
+
+function calculateMomentum(prices, period = 5) {
+  if (prices.length <= period) return 0;
+
+  const current = prices.at(-1);
+  const previous = prices.at(-(period + 1));
+
+  return previous ? ((current - previous) / previous) * 100 : 0;
+}
+
+function calculateSupportResistance(candles, period = 40) {
+  const recent = candles.slice(-period);
+
   return {
-    support:     supports[0]    ?? Math.min(...recent.map(c => c.low)),
-    resistance:  resistances[0] ?? Math.max(...recent.map(c => c.high)),
-    supports:    supports.slice(0, 3),
-    resistances: resistances.slice(0, 3)
+    support: Math.min(...recent.map(c => c.low)),
+    resistance: Math.max(...recent.map(c => c.high))
   };
 }
 
-// DETECTOR DE CHANDELIERS ET DE BOUGIES DE CONFIRMATION AVANCE
-function detectCandlePatternsAndConfirmations(candles, atrPercent) {
-  const n = candles.length;
-  if (n < 5) return { bullish: [], bearish: [], bullScore: 0, bearScore: 0, confirmed: false, confirmationDetails: [], volatilityRating: "MODEREE" };
+function getClosedCandles(candles, intervalMs, now = Date.now()) {
+  if (!intervalMs) return candles;
+  const closed = candles.filter(c => c.time + intervalMs <= now);
+  return closed.length >= 60 ? closed : candles.slice(0, -1);
+}
 
-  const bullish = [];
-  const bearish = [];
-  const confirmationDetails = [];
-  
-  const c0 = candles[candles.length - 1];
-  const c1 = candles[candles.length - 2];
-  const c2 = candles[candles.length - 3];
-  const c3 = candles[candles.length - 4];
+function candleBody(candle) {
+  return Math.abs(candle.close - candle.open);
+}
 
-  const body1 = Math.abs(c1.close - c1.open);
-  const range1 = c1.high - c1.low || 0.0001;
-  const upperWick1 = c1.high - Math.max(c1.close, c1.open);
-  const lowerWick1 = Math.min(c1.close, c1.open) - c1.low;
-  const isBull1 = c1.close > c1.open;
-  const isBear1 = c1.close < c1.open;
+function candleRange(candle) {
+  return Math.max(candle.high - candle.low, 0);
+}
 
-  const body0 = Math.abs(c0.close - c0.open);
-  const range0 = c0.high - c0.low || 0.0001;
-  const isBull0 = c0.close > c0.open;
-  const isBear0 = c0.close < c0.open;
+function isBullish(candle) {
+  return candle.close > candle.open;
+}
 
-  const body2 = Math.abs(c2.close - c2.open);
-  const isBear2 = c2.close < c2.open;
-  const isBull2 = c2.close > c2.open;
+function isBearish(candle) {
+  return candle.close < candle.open;
+}
 
-  const body3 = Math.abs(c3.close - c3.open);
-  const isBear3 = c3.close < c3.open;
-  const isBull3 = c3.close > c3.open;
+function detectSingleCandlePattern(candle) {
+  const range = candleRange(candle);
+  if (!range) return null;
 
-  const prevCandles = candles.slice(-7, -2);
-  const trendBullish = prevCandles[prevCandles.length - 1].close > prevCandles[0].close;
-  const trendBearish = prevCandles[prevCandles.length - 1].close < prevCandles[0].close;
+  const body = candleBody(candle);
+  const upperWick = candle.high - Math.max(candle.open, candle.close);
+  const lowerWick = Math.min(candle.open, candle.close) - candle.low;
+  const bodyRatio = body / range;
 
-  const avgBody = average(candles.slice(-15).map(c => Math.abs(c.close - c.open)));
-  const avgRange = average(candles.slice(-15).map(c => c.high - c.low));
-
-  let volatilityRating = "MODEREE";
-  const rcv0 = (c0.high - c0.low) / (avgRange || 0.0001);
-  const rcv1 = (c1.high - c1.low) / (avgRange || 0.0001);
-  const maxRcv = Math.max(rcv0, rcv1);
-
-  if (maxRcv > 2.2) {
-    volatilityRating = "EXCESSIF";
-  } else if (maxRcv < 0.35) {
-    volatilityRating = "COMPRESSE";
-  } else if (maxRcv >= 0.6 && maxRcv <= 1.8) {
-    volatilityRating = "STABLE";
-  } else {
-    volatilityRating = "CONTROLEE";
+  if (bodyRatio <= 0.35 && lowerWick >= body * 2.2 && upperWick <= body * 0.9) {
+    return { direction: 'bullish', name: 'Hammer / rejet acheteur' };
   }
 
-  let bullScore = 0;
-  let bearScore = 0;
-  let confirmed = false;
-
-  // 1. MARTEAU (HAMMER)
-  if (lowerWick1 >= body1 * 2.2 && upperWick1 <= body1 * 0.4 && range1 > avgRange * 0.6 && trendBearish) {
-    bullish.push("Marteau de Support");
-    bullScore += 12;
-
-    if (isBull0 && c0.close > c1.high) {
-      bullScore += 18;
-      confirmed = true;
-      confirmationDetails.push("Confirmation Marteau : La bougie C0 clôture au-dessus du plus haut du Marteau (Forte impulsion)");
-    } else if (isBull0 && c0.close > (c1.high + c1.low) / 2) {
-      bullScore += 10;
-      confirmed = true;
-      confirmationDetails.push("Confirmation Marteau partielle : La bougie C0 clôture au-dessus de 50% de la mèche");
-    } else {
-      confirmationDetails.push("Marteau repéré mais bougie de confirmation C0 absente ou indécise");
-    }
+  if (bodyRatio <= 0.35 && upperWick >= body * 2.2 && lowerWick <= body * 0.9) {
+    return { direction: 'bearish', name: 'Shooting star / rejet vendeur' };
   }
 
-  // 2. ÉTOILE FILANTE (SHOOTING STAR)
-  if (upperWick1 >= body1 * 2.2 && lowerWick1 <= body1 * 0.4 && range1 > avgRange * 0.6 && trendBullish) {
-    bearish.push("Étoile Filante (Shooting Star)");
-    bearScore += 12;
+  return null;
+}
 
-    if (isBear0 && c0.close < c1.low) {
-      bearScore += 18;
-      confirmed = true;
-      confirmationDetails.push("Confirmation Étoile Filante : Clôture sous le bas du pattern (Impulsion vendeuse)");
-    } else if (isBear0 && c0.close < (c1.high + c1.low) / 2) {
-      bearScore += 10;
-      confirmed = true;
-      confirmationDetails.push("Confirmation Étoile Filante partielle : Clôture sous la médiane du corps/hauteur");
-    } else {
-      confirmationDetails.push("Étoile Filante repérée mais bougie de confirmation C0 absente ou indécise");
-    }
-  }
+function detectCandlestickSetup(candles) {
+  if (candles.length < 4) return null;
 
-  // 3. AVALEMENT HAUSSIER (BULLISH ENGULFING)
-  if (isBear2 && isBull1 && c1.close >= c2.open && c1.open <= c2.close && body1 > avgBody * 0.7) {
-    bullish.push("Avalement Haussier");
-    bullScore += 15;
+  const patternCandle = candles.at(-2);
+  const confirmation = candles.at(-1);
+  const previous = candles.at(-3);
+  const beforePrevious = candles.at(-4);
+  const avgBody = average(candles.slice(-22, -2).map(candleBody));
+  const minBody = Math.max(avgBody * 0.45, patternCandle.close * 0.00015);
+  let setup = null;
 
-    if (isBull0 && c0.close > c1.close) {
-      bullScore += 15;
-      confirmed = true;
-      confirmationDetails.push("Confirmation Avalement Haussier : Continuation haussière confirmée sur la bougie suivante");
-    } else {
-      confirmationDetails.push("Avalement Haussier détecté sans impulsion confirmée sur la bougie C0");
-    }
-  }
+  const bullishEngulfing =
+    isBearish(previous) &&
+    isBullish(patternCandle) &&
+    candleBody(patternCandle) >= minBody &&
+    patternCandle.open <= previous.close &&
+    patternCandle.close >= previous.open;
 
-  // 4. AVALEMENT BAISSIER (BEARISH ENGULFING)
-  if (isBull2 && isBear1 && c1.close <= c2.open && c1.open >= c2.close && body1 > avgBody * 0.7) {
-    bearish.push("Avalement Baissier");
-    bearScore += 15;
+  const bearishEngulfing =
+    isBullish(previous) &&
+    isBearish(patternCandle) &&
+    candleBody(patternCandle) >= minBody &&
+    patternCandle.open >= previous.close &&
+    patternCandle.close <= previous.open;
 
-    if (isBear0 && c0.close < c1.close) {
-      bearScore += 15;
-      confirmed = true;
-      confirmationDetails.push("Confirmation Avalement Baissier : Continuation baissière confirmée sur la bougie suivante");
-    } else {
-      confirmationDetails.push("Avalement Baissier détecté sans impulsion confirmée sur la bougie C0");
-    }
-  }
+  const morningStar =
+    isBearish(beforePrevious) &&
+    candleBody(previous) <= candleBody(beforePrevious) * 0.65 &&
+    isBullish(patternCandle) &&
+    patternCandle.close > (beforePrevious.open + beforePrevious.close) / 2;
 
-  // 5. MORNING STAR
-  if (isBear3 && body3 > avgBody * 0.6 && Math.abs(c2.close - c2.open) < body3 * 0.45 && isBull1 && c1.close > (c3.open + c3.close) / 2) {
-    bullish.push("Étoile du Matin");
-    bullScore += 20;
+  const eveningStar =
+    isBullish(beforePrevious) &&
+    candleBody(previous) <= candleBody(beforePrevious) * 0.65 &&
+    isBearish(patternCandle) &&
+    patternCandle.close < (beforePrevious.open + beforePrevious.close) / 2;
 
-    if (isBull0 && c0.close > c1.close) {
-      bullScore += 12;
-      confirmed = true;
-      confirmationDetails.push("Confirmation Étoile du Matin : Continuation d'impulsion haussière validée par C0");
-    } else {
-      confirmationDetails.push("Étoile du Matin valide mais la bougie C0 subit des prises de bénéfices");
-    }
-  }
+  if (bullishEngulfing) setup = { direction: 'bullish', name: 'Bullish engulfing' };
+  if (bearishEngulfing) setup = { direction: 'bearish', name: 'Bearish engulfing' };
+  if (morningStar) setup = { direction: 'bullish', name: 'Morning star' };
+  if (eveningStar) setup = { direction: 'bearish', name: 'Evening star' };
 
-  // 6. EVENING STAR
-  if (isBull3 && body3 > avgBody * 0.6 && Math.abs(c2.close - c2.open) < body3 * 0.45 && isBear1 && c1.close < (c3.open + c3.close) / 2) {
-    bearish.push("Étoile du Soir");
-    bearScore += 20;
+  const single = detectSingleCandlePattern(patternCandle);
+  if (!setup && single) setup = single;
+  if (!setup) return null;
 
-    if (isBear0 && c0.close < c1.close) {
-      bearScore += 12;
-      confirmed = true;
-      confirmationDetails.push("Confirmation Étoile du Soir : Continuation d'impulsion baissière validée par C0");
-    } else {
-      confirmationDetails.push("Étoile du Soir valide mais la bougie C0 montre un timide rebond");
-    }
-  }
-
-  // 7. TWEEZER BOTTOM
-  if (isBear2 && isBull1 && Math.abs(c1.low - c2.low) / (avgRange || 0.0001) < 0.08 && trendBearish) {
-    bullish.push("Pince Haussière (Tweezer Bottom)");
-    bullScore += 10;
-
-    if (isBull0 && c0.close > Math.max(c1.close, c2.open)) {
-      bullScore += 12;
-      confirmed = true;
-      confirmationDetails.push("Confirmation Pince Haussière : Pivot de support Twitter Bottom validé et englobé");
-    }
-  }
-
-  // 8. TWEEZER TOP
-  if (isBull2 && isBear1 && Math.abs(c1.high - c2.high) / (avgRange || 0.0001) < 0.08 && trendBullish) {
-    bearish.push("Pince Baissière (Tweezer Top)");
-    bearScore += 10;
-
-    if (isBear0 && c0.close < Math.min(c1.close, c2.open)) {
-      bearScore += 12;
-      confirmed = true;
-      confirmationDetails.push("Confirmation Pince Baissière : pivot de résistance Twitter Top validé et cassé");
-    }
-  }
-
-  // 9. MARUBOZU
-  if (isBull1 && upperWick1 < body1 * 0.04 && lowerWick1 < body1 * 0.04 && body1 > avgBody * 1.4) {
-    bullish.push("Marubozu d'Impulsion Acheteuse");
-    bullScore += 12;
-    if (isBull0) {
-      bullScore += 8;
-      confirmed = true;
-      confirmationDetails.push("Confirmation Marubozu : La bougie de confirmation C0 confirme la pression d'accumulation");
-    }
-  }
-  if (isBear1 && upperWick1 < body1 * 0.04 && lowerWick1 < body1 * 0.04 && body1 > avgBody * 1.4) {
-    bearish.push("Marubozu d'Impulsion Vendeuse");
-    bearScore += 12;
-    if (isBear0) {
-      bearScore += 8;
-      confirmed = true;
-      confirmationDetails.push("Confirmation Marubozu : La bougie de confirmation C0 prolonge l'action vendeuse");
-    }
-  }
+  const bullishConfirmation =
+    setup.direction === 'bullish' &&
+    isBullish(confirmation) &&
+    confirmation.close > patternCandle.high;
+  const bearishConfirmation =
+    setup.direction === 'bearish' &&
+    isBearish(confirmation) &&
+    confirmation.close < patternCandle.low;
 
   return {
-    bullish: [...new Set(bullish)],
-    bearish: [...new Set(bearish)],
-    bullScore: round(bullScore, 1),
-    bearScore: round(bearScore, 1),
-    confirmed,
-    confirmationDetails,
-    volatilityRating
+    ...setup,
+    confirmed: bullishConfirmation || bearishConfirmation,
+    patternCandle,
+    confirmationCandle: confirmation
   };
 }
 
-// FORMATTEUR DE PLAN DE TRADING ET POSITION SIZING
-function createTradingPlan(signal, confidence, score, price, atr, support, resistance, percentB) {
-  const direction = signal === "SELL" || (signal === "HOLD" && score < 0) ? "SELL" : "BUY";
-  const isBuy = direction === "BUY";
-  
-  const atrSafety = Number.isFinite(atr) && atr > 0 ? atr : price * 0.003;
+function normalizeNewsScore(news = '') {
+  const text = String(news).toLowerCase();
+
+  const bull = ['bullish', 'breakout', 'surge', 'rally', 'upgrade', 'adoption'];
+  const bear = ['bearish', 'crash', 'dump', 'lawsuit', 'hack', 'ban'];
+
+  let score = 0;
+
+  for (const w of bull) if (text.includes(w)) score++;
+  for (const w of bear) if (text.includes(w)) score--;
+
+  return Math.max(-8, Math.min(8, score * 2));
+}
+
+function strengthFromConfidence(confidence) {
+  if (confidence >= 70) return 'FORTE';
+  if (confidence >= 45) return 'MOYENNE';
+  return 'FAIBLE';
+}
+
+function priceDigits(value) {
+  const abs = Math.abs(Number(value));
+
+  if (abs >= 1000) return 2;
+  if (abs >= 1) return 4;
+  return 8;
+}
+
+function formatPlanPrice(value, reference) {
+  const ref = Number.isFinite(reference) ? reference : value;
+  return round(value, priceDigits(ref));
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function createScalpingTradePlan({
+  signal,
+  score,
+  price,
+  atr,
+  support,
+  resistance,
+  confirmationCandle
+}) {
+  const direction = signal === 'SELL' || (signal === 'HOLD' && score < 0) ? 'SELL' : 'BUY';
+  const isBuy = direction === 'BUY';
+  const usableAtr = Number.isFinite(atr) && atr > 0 ? atr : price * 0.002;
   const minRisk = price * 0.0006;
-  const maxRisk = price * 0.012;
-  const baseRisk = clamp(atrSafety * 0.75, minRisk, maxRisk);
-  
-  let finalRisk = baseRisk;
+  const maxRisk = price * 0.006;
+  const baseRisk = clamp(usableAtr * 0.65, minRisk, maxRisk);
+  let risk = baseRisk;
 
   if (isBuy && Number.isFinite(support) && support > 0 && support < price) {
-    const distanceToSupport = price - support;
-    if (distanceToSupport < baseRisk * 1.6) {
-      finalRisk = Math.max(baseRisk, distanceToSupport * 1.08);
-    }
-  } else if (!isBuy && Number.isFinite(resistance) && resistance > price) {
-    const distanceToRes = resistance - price;
-    if (distanceToRes < baseRisk * 1.6) {
-      finalRisk = Math.max(baseRisk, distanceToRes * 1.08);
-    }
+    const supportRisk = price - support;
+    if (supportRisk <= baseRisk * 1.5) risk = Math.max(baseRisk, supportRisk + baseRisk * 0.12);
   }
 
-  const entry = price;
-  const entrySpread = clamp(atrSafety * 0.12, price * 0.0001, price * 0.001);
-  const stopLoss = isBuy ? entry - finalRisk : entry + finalRisk;
+  if (!isBuy && Number.isFinite(resistance) && resistance > price) {
+    const resistanceRisk = resistance - price;
+    if (resistanceRisk <= baseRisk * 1.5) risk = Math.max(baseRisk, resistanceRisk + baseRisk * 0.12);
+  }
 
-  const tp1 = isBuy ? entry + finalRisk * 1.15 : entry - finalRisk * 1.15;
-  const tp2 = isBuy ? entry + finalRisk * 2.20 : entry - finalRisk * 2.20;
-  const tp3 = isBuy ? entry + finalRisk * 3.40 : entry - finalRisk * 3.40;
-
-  const buyZoneLow = isBuy ? entry - entrySpread : entry + entrySpread;
-  const buyZoneHigh = isBuy ? entry + entrySpread : entry - entrySpread;
-
-  const validSupport = Number.isFinite(support) && support > 0 ? support : stopLoss;
-  const validResistance = Number.isFinite(resistance) && resistance > 0 ? resistance : tp2;
-  const riskPerUnit = Math.abs(entry - stopLoss);
+  const entryPad = clamp(usableAtr * 0.12, price * 0.00015, price * 0.0012);
+  const pendingEntry =
+    signal === 'BUY' && confirmationCandle
+      ? confirmationCandle.high + entryPad
+      : signal === 'SELL' && confirmationCandle
+        ? confirmationCandle.low - entryPad
+        : price;
+  const entry = pendingEntry;
+  const stopLoss = isBuy ? entry - risk : entry + risk;
+  const takeProfit1 = isBuy ? entry + risk * 0.85 : entry - risk * 0.85;
+  const takeProfit2 = isBuy ? entry + risk * 1.45 : entry - risk * 1.45;
+  const entryLow = isBuy ? entry - entryPad : entry + entryPad;
+  const entryHigh = isBuy ? entry + entryPad : entry - entryPad;
+  const safeSupport =
+    Number.isFinite(support) && support > 0 ? support : isBuy ? stopLoss : takeProfit2;
+  const safeResistance =
+    Number.isFinite(resistance) && resistance > 0 ? resistance : isBuy ? takeProfit2 : stopLoss;
+  const action = signal === 'HOLD' ? `WAIT_${direction}` : direction;
 
   return {
-    action:      signal === "HOLD" ? `STANDBY_${direction}` : direction,
-    entry:       formatPlanPrice(entry, price),
-    entryZone:   `${formatPlanPrice(Math.min(buyZoneLow, buyZoneHigh), price)} – ${formatPlanPrice(Math.max(buyZoneLow, buyZoneHigh), price)}`,
-    stopLoss:    formatPlanPrice(stopLoss, price),
-    sl:          formatPlanPrice(stopLoss, price),
-    takeProfit1: formatPlanPrice(tp1, price),
-    takeProfit2: formatPlanPrice(tp2, price),
-    takeProfit3: formatPlanPrice(tp3, price),
-    tp1:         formatPlanPrice(tp1, price),
-    tp2:         formatPlanPrice(tp2, price),
-    tp3:         formatPlanPrice(tp3, price),
-    takeProfit:  [formatPlanPrice(tp1, price), formatPlanPrice(tp2, price), formatPlanPrice(tp3, price)],
-    targets:     [formatPlanPrice(tp1, price), formatPlanPrice(tp2, price), formatPlanPrice(tp3, price)],
-    support:     formatPlanPrice(validSupport, price),
-    resistance:  formatPlanPrice(validResistance, price),
+    action,
+    entry: formatPlanPrice(entry, price),
+    entryZone: `${formatPlanPrice(Math.min(entryLow, entryHigh), price)} - ${formatPlanPrice(Math.max(entryLow, entryHigh), price)}`,
+    stopLoss: formatPlanPrice(stopLoss, price),
+    sl: formatPlanPrice(stopLoss, price),
+    takeProfit1: formatPlanPrice(takeProfit1, price),
+    takeProfit2: formatPlanPrice(takeProfit2, price),
+    tp1: formatPlanPrice(takeProfit1, price),
+    tp2: formatPlanPrice(takeProfit2, price),
+    takeProfit: [
+      formatPlanPrice(takeProfit1, price),
+      formatPlanPrice(takeProfit2, price)
+    ],
+    targets: [
+      formatPlanPrice(takeProfit1, price),
+      formatPlanPrice(takeProfit2, price)
+    ],
+    support: formatPlanPrice(safeSupport, price),
+    resistance: formatPlanPrice(safeResistance, price),
     invalidation: formatPlanPrice(stopLoss, price),
     riskReward: {
-      tp1: round(Math.abs(tp1 - entry) / riskPerUnit, 2),
-      tp2: round(Math.abs(tp2 - entry) / riskPerUnit, 2),
-      tp3: round(Math.abs(tp3 - entry) / riskPerUnit, 2)
+      tp1: round(Math.abs(takeProfit1 - entry) / Math.abs(entry - stopLoss), 2),
+      tp2: round(Math.abs(takeProfit2 - entry) / Math.abs(entry - stopLoss), 2)
     },
-    exitPlan: [
-      `TP1 (1.15x RR) : Clôturer 50% du volume pour sécuriser la transaction, basculer SL à B/E.`,
-      `TP2 (2.20x RR) : Clôturer 30% additionnel, laisser courir le reliquat avec Trailing Stop.`,
-      `TP3 (3.40x RR) : Sortie définitive de position.`
-    ].join(" | ")
+    orderType:
+      signal === 'BUY'
+        ? 'BUY_STOP'
+        : signal === 'SELL'
+          ? 'SELL_STOP'
+          : 'WAIT',
+    triggerNote:
+      signal === 'HOLD'
+        ? 'Aucun ordre: confiance inferieure au seuil requis.'
+        : 'Placer un ordre stop chez le broker: il ne doit etre execute que lorsque le prix touche ENTRY.',
+    exitPlan:
+      'Scalping: securiser a TP1, remonter le SL vers entry, sortir vite si la bougie casse le momentum.'
   };
 }
 
-// GENERATION COMPLETE DE SIGNAL
-function runSignalEngine(candles, news = "") {
-  const MIN_CANDLES = 60;
-  if (candles.length < MIN_CANDLES) {
-    return {
-      signal: "HOLD",
-      strength: "FAIBLE",
-      confidence: 0,
-      score: 0,
-      confirmations: 0,
-      reasons: ["Historique de prix dérisoire (60 bougies minimum requises)"],
-      indicators: {},
-      tradePlan: null
-    };
-  }
-
-  const closes = candles.map(c => c.close);
-  const last = candles[candles.length - 1];
-  const currentPrice = last.close;
-
-  // Optimisation CPU : Calcul des EMA exécuté une seule fois par variable
-  const ema9Array = calculateEMA(closes, 9);
-  const ema21Array = calculateEMA(closes, 21);
-  const ema50Array = calculateEMA(closes, 50);
-  const ema200Array = calculateEMA(closes, 200);
-
-  const ema9 = ema9Array[ema9Array.length - 1] ?? currentPrice;
-  const ema21 = ema21Array[ema21Array.length - 1] ?? currentPrice;
-  const ema50 = ema50Array[ema50Array.length - 1] ?? currentPrice;
-  const ema200 = ema200Array[ema200Array.length - 1] ?? currentPrice;
-
-  const rsi7 = calculateRSI(closes, 7);
-  const rsi14 = calculateRSI(closes, 14);
-  const stochRsi = calculateStochRSI(closes, 14, 14, 3, 3);
-  const macd = calculateMACD(closes);
-
-  const atr = calculateATR(candles, 14);
-  const atrPercent = currentPrice ? (atr / currentPrice) * 100 : 0;
-  const bb = calculateBollingerBands(closes, 20, 2);
-
-  const vwapData = calculateVWAP(candles, 30);
-  const { vwap } = vwapData;
-
-  const srLevels = calculateSupportResistance(candles, 60, 3);
-  const { support, resistance } = srLevels;
-
-  const patternResult = detectCandlePatternsAndConfirmations(candles, atrPercent);
-
-  const reasons = [];
-  let bullConfidence = 0;
-  let bearConfidence = 0;
-  let confirmations = 0;
-
-  if (ema9 > ema21 && ema21 > ema50) {
-    bullConfidence += 15;
-  } else if (ema9 > ema21) {
-    bullConfidence += 5;
-  }
-  if (currentPrice > ema200) {
-    bullConfidence += 5;
-  }
-  if (ema9 < ema21 && ema21 < ema50) {
-    bearConfidence += 15;
-  } else if (ema9 < ema21) {
-    bearConfidence += 5;
-  }
-  if (currentPrice < ema200) {
-    bearConfidence += 5;
-  }
-
-  if (rsi14 > 50 && rsi14 <= 70) {
-    bullConfidence += 10;
-  } else if (rsi14 > 70) {
-    bullConfidence += 3;
-  }
-  if (rsi7 > 55 && rsi7 < 80) {
-    bullConfidence += 5;
-  }
-  const stochBullCross = stochRsi.kPrev < stochRsi.dPrev && stochRsi.k > stochRsi.d;
-  if (stochBullCross && stochRsi.k < 40) {
-    bullConfidence += 5;
-  } else if (stochRsi.k > stochRsi.d && stochRsi.k < 80) {
-    bullConfidence += 3;
-  }
-
-  if (rsi14 < 50 && rsi14 >= 30) {
-    bearConfidence += 10;
-  } else if (rsi14 < 30) {
-    bearConfidence += 3;
-  }
-  if (rsi7 < 45 && rsi7 > 20) {
-    bearConfidence += 5;
-  }
-  const stochBearCross = stochRsi.kPrev > stochRsi.dPrev && stochRsi.k < stochRsi.d;
-  if (stochBearCross && stochRsi.k > 60) {
-    bearConfidence += 5;
-  } else if (stochRsi.k < stochRsi.d && stochRsi.k > 20) {
-    bearConfidence += 3;
-  }
-
-  const lastVol = last.volume || 1;
-  const recentVols = candles.slice(-10, -1).map(c => c.volume);
-  const medianVol = median(recentVols) || 1;
-  const volRatio = lastVol / medianVol;
-
-  if (volRatio > 1.3) {
-    if (last.close > last.open) {
-      bullConfidence += 10;
-    } else if (last.close < last.open) {
-      bearConfidence += 10;
-    }
-  } else if (volRatio > 1.0) {
-    if (last.close > last.open) {
-      bullConfidence += 5;
-    } else if (last.close < last.open) {
-      bearConfidence += 5;
-    }
-  }
-
-  if (macd.bullCross) {
-    bullConfidence += 8;
-  } else if (macd.histogram > 0) {
-    bullConfidence += 4;
-  }
-  if (currentPrice > vwap && currentPrice < vwapData.upper2) {
-    bullConfidence += 4;
-  }
-  if (bb.percentB < 0.2) {
-    bullConfidence += 3;
-  }
-
-  if (macd.bearCross) {
-    bearConfidence += 8;
-  } else if (macd.histogram < 0) {
-    bearConfidence += 4;
-  }
-  if (currentPrice < vwap && currentPrice > vwapData.lower2) {
-    bearConfidence += 4;
-  }
-  if (bb.percentB > 0.8) {
-    bearConfidence += 3;
-  }
-
-  if (patternResult.bullScore > 0) {
-    bullConfidence += 15;
-    reasons.push(`[Chandelier] Pattern haussier repéré : ${patternResult.bullish.join(", ")}`);
-    if (patternResult.confirmed) {
-      bullConfidence += 20;
-      confirmations += 2;
-    } else {
-      reasons.push(`[Chandelier] Signal haussier non validé par la bougie de confirmation C0`);
-    }
-  }
-
-  if (patternResult.bearScore > 0) {
-    bearConfidence += 15;
-    reasons.push(`[Chandelier] Pattern baissier repéré : ${patternResult.bearish.join(", ")}`);
-    if (patternResult.confirmed) {
-      bearConfidence += 20;
-      confirmations += 2;
-    } else {
-      reasons.push(`[Chandelier] Signal baissier non validé par la bougie de confirmation C0`);
-    }
-  }
-
-  if (patternResult.volatilityRating === "EXCESSIF") {
-    bullConfidence -= 18;
-    bearConfidence -= 18;
-    reasons.push(`⚠️ Volatilité excessive détectée (RCV excessive). Risque élevé d'oscillation : application d'un stabilizer penalty`);
-  } else if (patternResult.volatilityRating === "COMPRESSE") {
-    bullConfidence -= 15;
-    bearConfidence -= 15;
-    reasons.push(`⚠️ Force de marché comprimée (Volume/Portée dérisoires). Risque de stagnation, penalty appliqué`);
-  } else if (patternResult.volatilityRating === "STABLE") {
-    if (bullConfidence > bearConfidence) bullConfidence += 5;
-    else if (bearConfidence > bullConfidence) bullConfidence += 5;
-    reasons.push(`✓ Conditions de volatilité idéales ("STABLE"). Signal favorisé`);
-  }
-
-  const normalizedNews = news.toLowerCase();
-  if (normalizedNews.includes("bull") || normalizedNews.includes("long") || normalizedNews.includes("pump")) {
-    bullConfidence += 10;
-    reasons.push("Sentiment de news positif");
-  } else if (normalizedNews.includes("bear") || normalizedNews.includes("short") || normalizedNews.includes("dump")) {
-    bearConfidence += 10;
-    reasons.push("Sentiment de news négatif");
-  }
-
-  bullConfidence = clamp(bullConfidence, 0, 99);
-  bearConfidence = clamp(bearConfidence, 0, 99);
-
-  let signal = "HOLD";
-  let confidence = 0;
-
-  if (bullConfidence >= bearConfidence) {
-    confidence = bullConfidence;
-    if (bullConfidence >= 70) {
-      signal = "BUY";
-    }
-  } else {
-    confidence = bearConfidence;
-    if (bearConfidence >= 70) {
-      signal = "SELL";
-    }
-  }
-
-  if (signal === "HOLD") {
-    reasons.push(`Seuil de confiance de 70% non atteint. (Bull : ${bullConfidence}%, Bear : ${bearConfidence}%). Standby (HOLD).`);
-  } else {
-    confirmations += 1;
-    reasons.push(`Signal de trading [${signal}] validé avec succès avec ${confidence}% de confiance.`);
-  }
-
-  function strengthFromConfidence(conf) {
-    if (conf >= 85) return "EXTREME";
-    if (conf >= 70) return "FORTE";
-    if (conf >= 55) return "MOYENNE";
-    return "FAIBLE";
-  }
-
-  const netScore = round(bullConfidence - bearConfidence, 1);
-  const tradePlan = createTradingPlan(signal, confidence, netScore, currentPrice, atr, support, resistance, bb.percentB);
-
-  return {
-    signal,
-    strength: strengthFromConfidence(confidence),
-    confidence,
-    score: netScore,
-    confirmations,
-    tradePlan,
-    indicators: {
-      rsi7:            round(rsi7, 2),
-      rsi14:           round(rsi14, 2),
-      stochRsiK:       round(stochRsi.k, 2),
-      stochRsiD:       round(stochRsi.d, 2),
-      ema9:            formatPrice(ema9),
-      ema21:           formatPrice(ema21),
-      ema50:           formatPrice(ema50),
-      ema200:          formatPrice(ema200),
-      macd:            round(macd.macd, 6),
-      macdSignal:      round(macd.signal, 6),
-      macdHistogram:   round(macd.histogram, 6),
-      macdCross:       macd.bullCross ? "BULL" : macd.bearCross ? "BEAR" : "NONE",
-      bbUpper:         formatPrice(bb.upper),
-      bbMiddle:        formatPrice(bb.middle),
-      bbLower:         formatPrice(bb.lower),
-      bbPercentB:      round(bb.percentB, 3),
-      atr:             formatPrice(atr),
-      atrPercent:      round(atrPercent, 2),
-      vwap:            formatPrice(vwap),
-      support:         formatPrice(support),
-      resistance:      formatPrice(resistance),
-      volatilityRating: patternResult.volatilityRating,
-      candlePatterns:  {
-        bullish:             patternResult.bullish,
-        bearish:             patternResult.bearish,
-        bullScore:           patternResult.bullScore,
-        bearScore:           patternResult.bearScore,
-        confirmed:           patternResult.confirmed,
-        confirmationDetails: patternResult.confirmationDetails
-      }
-    },
-    reasons
-  };
-}
-
-function resolveStabilizedSignal(key, freshAnalysis) {
-  const now = Date.now();
-  const existing = getLockedSignal(key);
-
-  if (!existing) {
-    if (freshAnalysis.signal !== "HOLD" && freshAnalysis.confidence >= 70) {
-      const lock = {
-        signal:      freshAnalysis.signal,
-        confidence:  freshAnalysis.confidence,
-        score:       freshAnalysis.score,
-        lockedAt:    now,
-        expiresAt:   now + SIGNAL_LOCK_MS,
-        tradePlan:   freshAnalysis.tradePlan,
-        reasons:     [...freshAnalysis.reasons]
-      };
-      SIGNAL_LOCKS.set(key, lock);
-      return buildLockedResponse(lock, freshAnalysis, now);
-    }
-    return buildLockedResponse(null, freshAnalysis, now);
-  }
-
-  return buildLockedResponse(existing, freshAnalysis, now);
-}
-
-function buildLockedResponse(lock, freshAnalysis, now) {
-  const isLocked = lock !== null;
-  const secondsRemaining = isLocked ? Math.max(0, Math.round((lock.expiresAt - now) / 1000)) : 0;
-  const minutesRemaining = Math.floor(secondsRemaining / 60);
-  const secsDisplay = secondsRemaining % 60;
-
-  return {
-    signal:        isLocked ? lock.signal     : freshAnalysis.signal,
-    strength:      isLocked ? (lock.confidence >= 85 ? "EXTREME" : "FORTE") : freshAnalysis.strength,
-    confidence:    isLocked ? lock.confidence : freshAnalysis.confidence,
-    score:         isLocked ? lock.score      : freshAnalysis.score,
-    confirmations: freshAnalysis.confirmations,
-    signalLock: {
-      active:         isLocked,
-      lockedAt:       isLocked ? new Date(lock.lockedAt).toISOString()  : null,
-      expiresAt:      isLocked ? new Date(lock.expiresAt).toISOString() : null,
-      secondsRemaining,
-      countdown:      isLocked ? `${minutesRemaining}:${String(secsDisplay).padStart(2, '0')}` : null,
-      lockDurationMs: SIGNAL_LOCK_MS
-    },
-    tradePlan: isLocked ? lock.tradePlan : freshAnalysis.tradePlan,
-    indicators: freshAnalysis.indicators,
-    reasons: isLocked
-      ? [...lock.reasons, `🔒 SIGNAL BLOQUÉ — Données fixes pour encore ${minutesRemaining}m ${secsDisplay}s (Stabilité)` ]
-      : freshAnalysis.reasons
-  };
-}
-
-// ─── ACCES AUX API DE MARCHÉ ET NORMALISATION ─────────────────────────
 function normalizeCandles(candles) {
   return candles
     .map(c => ({
-      time:   Number(c.time),
-      open:   Number(c.open),
-      high:   Number(c.high),
-      low:    Number(c.low),
-      close:  Number(c.close),
+      time: Number(c.time),
+      open: Number(c.open),
+      high: Number(c.high),
+      low: Number(c.low),
+      close: Number(c.close),
       volume: Number(c.volume || 0)
     }))
-    .filter(c =>
-      Number.isFinite(c.time)  && Number.isFinite(c.open)  && Number.isFinite(c.high) &&
-      Number.isFinite(c.low)   && Number.isFinite(c.close) &&
-      c.open > 0 && c.high > 0 && c.low > 0 && c.close > 0
+    .filter(
+      c =>
+        Number.isFinite(c.time) &&
+        Number.isFinite(c.open) &&
+        Number.isFinite(c.high) &&
+        Number.isFinite(c.low) &&
+        Number.isFinite(c.close) &&
+        c.open > 0 &&
+        c.high > 0 &&
+        c.low > 0 &&
+        c.close > 0
     )
     .sort((a, b) => a.time - b.time);
 }
 
 function applyCurrentPrice(candles, currentPrice) {
-  if (!candles.length || !Number.isFinite(currentPrice) || currentPrice <= 0) return candles;
+  if (!candles.length || !Number.isFinite(currentPrice) || currentPrice <= 0) {
+    return candles;
+  }
+
   const updated = candles.map(c => ({ ...c }));
-  const last = updated[updated.length - 1];
+  const last = updated.at(-1);
   last.close = currentPrice;
-  last.high  = Math.max(last.high, currentPrice);
-  last.low   = Math.min(last.low,  currentPrice);
+  last.high = Math.max(last.high, currentPrice);
+  last.low = Math.min(last.low, currentPrice);
   return updated;
 }
 
+function aggregateCandles(candles, bucketMs) {
+  if (!bucketMs) return candles;
+
+  const grouped = new Map();
+
+  for (const candle of candles) {
+    const bucket = Math.floor(candle.time / bucketMs) * bucketMs;
+    const current = grouped.get(bucket);
+
+    if (!current) {
+      grouped.set(bucket, { ...candle, time: bucket });
+      continue;
+    }
+
+    current.high = Math.max(current.high, candle.high);
+    current.low = Math.min(current.low, candle.low);
+    current.close = candle.close;
+    current.volume += candle.volume || 0;
+  }
+
+  return [...grouped.values()].sort((a, b) => a.time - b.time);
+}
+
 function splitTradingViewSymbol(rawSymbol) {
-  const raw = String(rawSymbol || "").trim();
-  const parts = raw.split(":");
-  if (parts.length > 1) return { exchange: parts[0].toLowerCase(), symbol: parts.slice(1).join(":") };
-  return { exchange: "", symbol: raw };
+  const raw = String(rawSymbol || '').trim();
+  const parts = raw.split(':');
+
+  if (parts.length > 1) {
+    return {
+      exchange: parts[0].toLowerCase(),
+      symbol: parts.slice(1).join(':')
+    };
+  }
+
+  return { exchange: '', symbol: raw };
 }
 
 function compactSymbol(symbol) {
-  return String(symbol || "").toUpperCase().trim()
-    .replace(/\s+/g, " ").replace(/\.P$/, "").replace(/PERP$/, "");
+  return String(symbol || '')
+    .toUpperCase()
+    .trim()
+    .replace(/\s+/g, ' ')
+    .replace(/\.P$/, '')
+    .replace(/PERP$/, '');
 }
 
 function normalizeCryptoPair(rawSymbol) {
   const { exchange, symbol } = splitTradingViewSymbol(rawSymbol);
-  const cleaned  = compactSymbol(symbol).replace(/[-/_\s]/g, "").replace(/[^A-Z0-9]/g, "");
-  const quotes   = ["USDT", "USDC", "BUSD", "USD", "EUR", "BTC", "ETH"];
-  const quote    = quotes.find(q => cleaned.endsWith(q) && cleaned.length > q.length);
-  const base     = quote ? cleaned.slice(0, -quote.length) : cleaned;
-  const stableQ  = quote && quote !== "USD" ? quote : "USDT";
+  const upperSymbol = String(symbol || '').toUpperCase();
+  const isPerp = /\.P$/.test(upperSymbol) || upperSymbol.includes('PERP');
+  const cleaned = compactSymbol(symbol)
+    .replace(/[-/_\s]/g, '')
+    .replace(/[^A-Z0-9]/g, '');
+
+  const quotes = ['USDT', 'USDC', 'BUSD', 'USD', 'EUR', 'BTC', 'ETH'];
+  const quote = quotes.find(q => cleaned.endsWith(q) && cleaned.length > q.length);
+  const base = quote ? cleaned.slice(0, -quote.length) : cleaned;
+  const stableQuote = quote && quote !== 'USD' ? quote : 'USDT';
+
   return {
     exchange,
     base,
-    quote: quote || "USDT",
-    binanceSymbol:   `${base}${stableQ}`,
-    bybitSymbol:     `${base}${stableQ}`,
-    coinbaseProduct: `${base}-${quote === "EUR" ? "EUR" : "USD"}`.toUpperCase(),
-    bitstampPair:    `${base}${quote === "EUR" ? "EUR" : "USD"}`.toLowerCase()
+    quote: quote || 'USDT',
+    binanceSymbol: `${base}${stableQuote}`,
+    bybitSymbol: `${base}${stableQuote}`,
+    coinbaseProduct: `${base}-${quote === 'EUR' ? 'EUR' : 'USD'}`,
+    bitstampPair: `${base}${quote === 'EUR' ? 'EUR' : 'USD'}`.toLowerCase(),
+    isPerp
   };
 }
 
 function resolveYahooSymbol(rawSymbol, type) {
   const { symbol } = splitTradingViewSymbol(rawSymbol);
   const normalized = compactSymbol(symbol);
-  const aliasKey   = normalized.replace(/[-/_^=.\s]/g, "");
+  const aliasKey = normalized.replace(/[-/_^=.\s]/g, '');
+
   if (YAHOO_SYMBOL_ALIASES[normalized]) return YAHOO_SYMBOL_ALIASES[normalized];
-  if (YAHOO_SYMBOL_ALIASES[aliasKey])   return YAHOO_SYMBOL_ALIASES[aliasKey];
-  if (normalized.includes("=") || normalized.startsWith("^")) return normalized;
-  const compact = normalized.replace(/[-/_\s]/g, "");
-  if (type === "forex" && /^[A-Z]{6}$/.test(compact)) return `${compact}=X`;
+  if (YAHOO_SYMBOL_ALIASES[aliasKey]) return YAHOO_SYMBOL_ALIASES[aliasKey];
+  if (normalized.includes('=') || normalized.startsWith('^')) return normalized;
+
+  const compact = normalized.replace(/[-/_\s]/g, '');
+  if (type === 'forex' && /^[A-Z]{6}$/.test(compact)) return `${compact}=X`;
+
   return normalized;
 }
 
-// FETCH DE DONNÉES BINANCE SPOT
+function providerOrder(provider, exchange) {
+  const preferred = String(provider || exchange || '').toLowerCase();
+
+  if (preferred.includes('coinbase')) return ['coinbase', 'binance', 'bybit'];
+  if (preferred.includes('bitstamp')) return ['bitstamp', 'coinbase', 'binance', 'bybit'];
+  if (preferred.includes('bybit')) return ['bybit', 'binance', 'coinbase'];
+  if (preferred.includes('yahoo')) return ['yahoo'];
+
+  return ['binance', 'bybit', 'coinbase'];
+}
+
 async function fetchBinanceCrypto(pair, timeConfig) {
+  const baseUrl = pair.isPerp
+    ? 'https://fapi.binance.com/fapi/v1'
+    : 'https://api.binance.com/api/v3';
   const [klinesResponse, tickerResponse] = await Promise.all([
-    HTTP.get("https://api.binance.com/api/v3/klines", {
-      params: { symbol: pair.binanceSymbol, interval: timeConfig.binance, limit: 300 }
+    HTTP.get(`${baseUrl}/klines`, {
+      params: {
+        symbol: pair.binanceSymbol,
+        interval: timeConfig.binance,
+        limit: 500
+      }
     }),
-    HTTP.get("https://api.binance.com/api/v3/ticker/price", {
+    HTTP.get(`${baseUrl}/ticker/price`, {
       params: { symbol: pair.binanceSymbol }
     }).catch(() => null)
   ]);
-  
-  const rawCandles = klinesResponse.data.map(c => ({
-    time: c[0], open: c[1], high: c[2], low: c[3], close: c[4], volume: c[5]
-  }));
-  const candles = normalizeCandles(rawCandles);
-  const currentPrice = Number(tickerResponse?.data?.price) || candles[candles.length - 1]?.close || 0;
-  return { candles: applyCurrentPrice(candles, currentPrice), currentPrice, source: `Binance Spot (${pair.binanceSymbol})` };
+
+  const candles = normalizeCandles(
+    klinesResponse.data.map(c => ({
+      time: c[0],
+      open: c[1],
+      high: c[2],
+      low: c[3],
+      close: c[4],
+      volume: c[5]
+    }))
+  );
+
+  const currentPrice = Number(tickerResponse?.data?.price);
+
+  return {
+    candles: applyCurrentPrice(candles, currentPrice),
+    currentPrice,
+    source: `Binance ${pair.isPerp ? 'USDT-M Futures' : 'Spot'} (${pair.binanceSymbol})`
+  };
 }
 
-// FETCH DE DONNÉES BYBIT SPOT
 async function fetchBybitCrypto(pair, timeConfig) {
-  const response = await HTTP.get("https://api.bybit.com/v5/market/kline", {
-    params: { category: "spot", symbol: pair.bybitSymbol, interval: timeConfig.bybit, limit: 200 }
-  });
-  if (response.data?.retCode !== 0) throw new Error(response.data?.retMsg || "Bybit error");
-  
-  const rawCandles = (response.data?.result?.list || []).map(c => ({
-    time: Number(c[0]), open: c[1], high: c[2], low: c[3], close: c[4], volume: c[5]
-  }));
-  const candles = normalizeCandles(rawCandles);
-  return { candles, currentPrice: candles[candles.length - 1]?.close ?? 0, source: `Bybit Spot (${pair.bybitSymbol})` };
-}
-
-// FETCH DE DONNÉES COINBASE PRO
-async function fetchCoinbaseCrypto(pair, timeConfig) {
-  if (!timeConfig.coinbaseGranularity) throw new Error("Intervalle non supporté par Coinbase");
-  const end = Math.floor(Date.now() / 1000);
-  const start = end - timeConfig.coinbaseGranularity * 250;
+  const category = pair.isPerp ? 'linear' : 'spot';
   const [response, tickerResponse] = await Promise.all([
-    HTTP.get(`https://api.exchange.coinbase.com/products/${pair.coinbaseProduct}/candles`, {
+    HTTP.get('https://api.bybit.com/v5/market/kline', {
       params: {
-        start: new Date(start * 1000).toISOString(),
-        end:   new Date(end * 1000).toISOString(),
-        granularity: timeConfig.coinbaseGranularity
+        category,
+        symbol: pair.bybitSymbol,
+        interval: timeConfig.bybit,
+        limit: 500
       }
     }),
+    HTTP.get('https://api.bybit.com/v5/market/tickers', {
+      params: {
+        category,
+        symbol: pair.bybitSymbol
+      }
+    }).catch(() => null)
+  ]);
+
+  if (response.data?.retCode !== 0) {
+    throw new Error(response.data?.retMsg || 'Bybit error');
+  }
+
+  const candles = normalizeCandles(
+    (response.data?.result?.list || []).map(c => ({
+      time: c[0],
+      open: c[1],
+      high: c[2],
+      low: c[3],
+      close: c[4],
+      volume: c[5]
+    }))
+  );
+
+  const currentPrice = Number(tickerResponse?.data?.result?.list?.[0]?.lastPrice);
+
+  return {
+    candles: applyCurrentPrice(candles, currentPrice),
+    currentPrice,
+    source: `Bybit ${pair.isPerp ? 'Linear' : 'Spot'} (${pair.bybitSymbol})`
+  };
+}
+
+async function fetchCoinbaseCrypto(pair, timeConfig) {
+  if (!timeConfig.coinbaseGranularity) {
+    throw new Error('Intervalle non supporte par Coinbase');
+  }
+
+  const end = Math.floor(Date.now() / 1000);
+  const start = end - timeConfig.coinbaseGranularity * 300;
+  const [response, tickerResponse] = await Promise.all([
+    HTTP.get(
+      `https://api.exchange.coinbase.com/products/${pair.coinbaseProduct}/candles`,
+      {
+        params: {
+          start: new Date(start * 1000).toISOString(),
+          end: new Date(end * 1000).toISOString(),
+          granularity: timeConfig.coinbaseGranularity
+        }
+      }
+    ),
     HTTP.get(`https://api.exchange.coinbase.com/products/${pair.coinbaseProduct}/ticker`).catch(() => null)
   ]);
-  const rawCandles = (response.data || []).map(c => ({
-    time: c[0] * 1000, low: c[1], high: c[2], open: c[3], close: c[4], volume: c[5]
-  }));
-  const candles = normalizeCandles(rawCandles);
-  const currentPrice = Number(tickerResponse?.data?.price) || candles[candles.length - 1]?.close || 0;
-  return { candles: applyCurrentPrice(candles, currentPrice), currentPrice, source: `Coinbase Pro (${pair.coinbaseProduct})` };
+
+  const candles = normalizeCandles(
+    response.data.map(c => ({
+      time: c[0] * 1000,
+      low: c[1],
+      high: c[2],
+      open: c[3],
+      close: c[4],
+      volume: c[5]
+    }))
+  );
+
+  const currentPrice = Number(tickerResponse?.data?.price);
+
+  return {
+    candles: applyCurrentPrice(candles, currentPrice),
+    currentPrice,
+    source: `Coinbase Exchange (${pair.coinbaseProduct})`
+  };
 }
 
-// LAUNCHERS SELECTOR
-async function fetchCryptoMarket(rawSymbol, timeConfig, preferredProvider = "") {
-  const pair = normalizeCryptoPair(rawSymbol);
-  const order = preferredProvider === "bybit" ? ["bybit", "binance", "coinbase"] : ["binance", "bybit", "coinbase"];
-  const errors = [];
-  
-  for (const provider of order) {
-    try {
-      if (provider === "binance") return await fetchBinanceCrypto(pair, timeConfig);
-      if (provider === "bybit") return await fetchBybitCrypto(pair, timeConfig);
-      if (provider === "coinbase") return await fetchCoinbaseCrypto(pair, timeConfig);
-    } catch (e) {
-      errors.push(`${provider} : ${e.message}`);
-    }
+async function fetchBitstampCrypto(pair, timeConfig) {
+  if (!timeConfig.bitstampStep) {
+    throw new Error('Intervalle non supporte par Bitstamp');
   }
-  throw new Error(`Échec de toutes les sources crypto : ${errors.join(" | ")}`);
+
+  const [ohlcResponse, tickerResponse] = await Promise.all([
+    HTTP.get(`https://www.bitstamp.net/api/v2/ohlc/${pair.bitstampPair}/`, {
+      params: {
+        step: timeConfig.bitstampStep,
+        limit: 1000
+      }
+    }),
+    HTTP.get(`https://www.bitstamp.net/api/v2/ticker/${pair.bitstampPair}/`).catch(() => null)
+  ]);
+
+  let candles = normalizeCandles(
+    (ohlcResponse.data?.data?.ohlc || []).map(c => ({
+      time: Number(c.timestamp) * 1000,
+      open: c.open,
+      high: c.high,
+      low: c.low,
+      close: c.close,
+      volume: c.volume
+    }))
+  );
+
+  candles = aggregateCandles(candles, timeConfig.bitstampAggregateMs);
+
+  const currentPrice = Number(tickerResponse?.data?.last);
+
+  return {
+    candles: applyCurrentPrice(candles, currentPrice),
+    currentPrice,
+    source: `Bitstamp (${pair.bitstampPair.toUpperCase()})`
+  };
 }
 
-// FETCH TRADITIONNEL VIA YAHOO FINANCE
 async function fetchYahooMarket(rawSymbol, type, timeConfig) {
   const yahooSymbol = resolveYahooSymbol(rawSymbol, type);
-  const endpoints = [
+  const response = await HTTP.get(
     `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}`,
-    `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}`
-  ];
+    {
+      params: {
+        interval: timeConfig.yahooInt,
+        range: timeConfig.yahooRange,
+        includePrePost: true,
+        events: 'history'
+      }
+    }
+  );
 
-  let lastError;
-  for (const url of endpoints) {
+  const result = response.data?.chart?.result?.[0];
+  const error = response.data?.chart?.error;
+  if (!result || error) {
+    throw new Error(error?.description || 'Yahoo Finance error');
+  }
+
+  const quote = result?.indicators?.quote?.[0];
+  const timestamps = result?.timestamp || [];
+  if (!quote) throw new Error('Yahoo Finance quote vide');
+
+  let candles = normalizeCandles(
+    timestamps.map((t, i) => ({
+      time: t * 1000,
+      open: quote.open?.[i],
+      high: quote.high?.[i],
+      low: quote.low?.[i],
+      close: quote.close?.[i],
+      volume: quote.volume?.[i] || 0
+    }))
+  );
+
+  candles = aggregateCandles(candles, timeConfig.aggregateMs);
+
+  const currentPrice = Number(result?.meta?.regularMarketPrice);
+
+  return {
+    candles: applyCurrentPrice(candles, currentPrice),
+    currentPrice,
+    source: `Yahoo Finance (${yahooSymbol})`
+  };
+}
+
+async function fetchCryptoMarket(rawSymbol, timeConfig, provider) {
+  const pair = normalizeCryptoPair(rawSymbol);
+  const attempts = providerOrder(provider, pair.exchange);
+  const errors = [];
+
+  for (const attempt of attempts) {
     try {
-      const response = await HTTP.get(url, {
-        params: {
-          interval:       timeConfig.yahooInt,
-          range:          timeConfig.yahooRange,
-          includePrePost: true,
-          events:         "history"
-        },
-        headers: {
-          "Accept-Language": "en-US,en;q=0.9",
-          "Referer":         "https://finance.yahoo.com"
-        }
-      });
-      const result = response.data?.chart?.result?.[0];
-      const error  = response.data?.chart?.error;
-      if (!result || error) throw new Error(error?.description || "Yahoo Finance chart error");
-      const quote = result?.indicators?.quote?.[0];
-      const timestamps = result?.timestamp || [];
-      if (!quote) throw new Error("Yahoo Finance quote vide");
-      
-      const candles = normalizeCandles(timestamps.map((t, i) => ({
-        time: t * 1000,
-        open: quote.open?.[i],
-        high: quote.high?.[i],
-        low:  quote.low?.[i],
-        close: quote.close?.[i],
-        volume: quote.volume?.[i] || 0
-      })));
-      const currentPrice = Number(result?.meta?.regularMarketPrice) || candles[candles.length - 1]?.close || 0;
-      return { candles: applyCurrentPrice(candles, currentPrice), currentPrice, source: `Yahoo Finance (${yahooSymbol})` };
-    } catch (err) {
-      lastError = err;
+      if (attempt === 'bitstamp') return await fetchBitstampCrypto(pair, timeConfig);
+      if (attempt === 'binance') return await fetchBinanceCrypto(pair, timeConfig);
+      if (attempt === 'bybit') return await fetchBybitCrypto(pair, timeConfig);
+      if (attempt === 'coinbase') return await fetchCoinbaseCrypto(pair, timeConfig);
+    } catch (error) {
+      errors.push(`${attempt}: ${error.message}`);
     }
   }
-  throw lastError || new Error("Yahoo Finance inaccessible ou indisponible");
+
+  throw new Error(errors.join(' | ') || 'Aucune source crypto disponible');
 }
 
 async function fetchMarketData({ symbol, type, timeConfig, provider }) {
-  if (type === "crypto") return fetchCryptoMarket(symbol, timeConfig, provider);
+  if (type === 'crypto') {
+    return fetchCryptoMarket(symbol, timeConfig, provider);
+  }
+
   return fetchYahooMarket(symbol, type, timeConfig);
 }
 
-// ============================================================
-// ROUTES DE L'API REST
-// ============================================================
+function generateScalpingSignal(candles, options = {}) {
+  const analysisCandles = getClosedCandles(candles, options.intervalMs);
 
-app.get("/api/health", (req, res) => {
-  res.json({
-    status: "ok",
-    uptime: round(process.uptime(), 2),
-    timestamp: new Date().toISOString(),
-    cache: { size: CACHE.size, maxSize: 200 },
-    locks: { active: SIGNAL_LOCKS.size },
-    stabilizationSettings: {
-      lockDurationMs: SIGNAL_LOCK_MS,
-      minimumConfidenceRequirement: 70
+  if (analysisCandles.length < 60) {
+    return {
+      signal: 'HOLD',
+      strength: 'FAIBLE',
+      confidence: 0,
+      score: 0,
+      reasons: ['Pas assez de donnees']
+    };
+  }
+
+  const closes = analysisCandles.map(c => c.close);
+  const last = analysisCandles.at(-1);
+  const previous = analysisCandles.at(-2);
+  const price = last.close;
+
+  const ema9 = calculateEMA(closes, 9).at(-1);
+  const ema21 = calculateEMA(closes, 21).at(-1);
+  const ema50 = calculateEMA(closes, 50).at(-1);
+  const ema200 = calculateEMA(closes, 200).at(-1);
+
+  const rsi7 = calculateRSI(closes, 7);
+  const rsi14 = calculateRSI(closes, 14);
+  const macd = calculateMACD(closes);
+  const atr = calculateATR(analysisCandles, 14);
+  const atrPercent = price ? (atr / price) * 100 : 0;
+  const vwap = calculateVWAP(analysisCandles, 30);
+  const volumeRatio = calculateVolumeRatio(analysisCandles, 20);
+  const momentum = calculateMomentum(closes, 5);
+  const momentumThreshold = Math.max(0.08, Math.min(0.35, atrPercent * 0.2));
+  const { support, resistance } = calculateSupportResistance(analysisCandles);
+  const range = Math.max(resistance - support, atr || 0);
+  const nearSupport = range ? (price - support) / range : 0.5;
+  const nearResistance = range ? (resistance - price) / range : 0.5;
+  const candlestickSetup = detectCandlestickSetup(analysisCandles);
+
+  let score = 0;
+  const reasons = [];
+
+  if (ema9 > ema21 && ema21 > ema50) {
+    score += 22;
+    reasons.push('Tendance courte haussiere');
+  } else if (ema9 < ema21 && ema21 < ema50) {
+    score -= 22;
+    reasons.push('Tendance courte baissiere');
+  }
+
+  if (Number.isFinite(ema200) && price > ema200) {
+    score += 8;
+  } else if (Number.isFinite(ema200) && price < ema200) {
+    score -= 8;
+  }
+
+  if (price > vwap) score += 9;
+  if (price < vwap) score -= 9;
+
+  if (macd.histogram > 0 && macd.macd > macd.signal) {
+    score += 10;
+    reasons.push('MACD positif');
+  } else if (macd.histogram < 0 && macd.macd < macd.signal) {
+    score -= 10;
+    reasons.push('MACD negatif');
+  }
+
+  if (rsi14 >= 55 && rsi14 <= 70) score += 9;
+  if (rsi14 <= 45 && rsi14 >= 30) score -= 9;
+  if (rsi7 > 74) score -= 7;
+  if (rsi7 < 26) score += 7;
+
+  if (momentum > momentumThreshold) {
+    score += 10;
+    reasons.push('Momentum acheteur');
+  } else if (momentum < -momentumThreshold) {
+    score -= 10;
+    reasons.push('Momentum vendeur');
+  }
+
+  if (volumeRatio > 1.15 && last.close > last.open) score += 5;
+  if (volumeRatio > 1.15 && last.close < last.open) score -= 5;
+
+  if (nearSupport < 0.18 && price > previous.close) score += 5;
+  if (nearResistance < 0.18 && price < previous.close) score -= 5;
+
+  if (candlestickSetup?.confirmed) {
+    const isBullishSetup = candlestickSetup.direction === 'bullish';
+    score += isBullishSetup ? 24 : -24;
+    reasons.push(`${candlestickSetup.name} confirme par la bougie suivante`);
+
+    if (isBullishSetup && price > ema21 && price > vwap) {
+      score += 8;
+      reasons.push('Confirmation haussiere alignee avec EMA/VWAP');
     }
+
+    if (!isBullishSetup && price < ema21 && price < vwap) {
+      score -= 8;
+      reasons.push('Confirmation baissiere alignee avec EMA/VWAP');
+    }
+  } else if (candlestickSetup) {
+    reasons.push(`${candlestickSetup.name} detecte sans confirmation`);
+    score *= 0.82;
+  } else {
+    score *= 0.92;
+  }
+
+  if (atrPercent > 4) {
+    score *= 0.85;
+    reasons.push('Volatilite elevee');
+  }
+
+  score += normalizeNewsScore(options.news);
+
+  const confidence = Math.min(95, Math.round(Math.abs(score)));
+  let signal = 'HOLD';
+
+  if (score >= 70 && confidence >= 70) signal = 'BUY';
+  if (score <= -70 && confidence >= 70) signal = 'SELL';
+
+  if (signal === 'HOLD' && confidence < 70) {
+    reasons.push('Confiance inferieure a 70%: HOLD obligatoire');
+  }
+
+  if (!reasons.length) reasons.push('Marche neutre ou signaux contradictoires');
+
+  const tradePlan = createScalpingTradePlan({
+    signal,
+    score,
+    price,
+    atr,
+    support,
+    resistance,
+    confirmationCandle: candlestickSetup?.confirmed
+      ? candlestickSetup.confirmationCandle
+      : null
+  });
+
+  return {
+    signal,
+    strength: strengthFromConfidence(confidence),
+    confidence,
+    score: round(score, 1),
+    tradePlan,
+    indicators: {
+      rsi7: round(rsi7, 2),
+      rsi14: round(rsi14, 2),
+      ema9: formatPrice(ema9),
+      ema21: formatPrice(ema21),
+      ema50: formatPrice(ema50),
+      ema200: formatPrice(ema200),
+      macd: round(macd.macd, 6),
+      macdSignal: round(macd.signal, 6),
+      atr: formatPrice(atr),
+      atrPercent: round(atrPercent, 2),
+      vwap: formatPrice(vwap),
+      volumeRatio: round(volumeRatio, 2),
+      momentum: round(momentum, 3),
+      support: formatPrice(support),
+      resistance: formatPrice(resistance)
+    },
+    candlestickPattern: candlestickSetup
+      ? {
+          name: candlestickSetup.name,
+          direction: candlestickSetup.direction,
+          confirmed: candlestickSetup.confirmed
+        }
+      : null,
+    candleAnalysis: {
+      requestedCandles: candles.length,
+      closedCandles: analysisCandles.length,
+      lastClosedCandleTime: new Date(last.time).toISOString()
+    },
+    reasons
+  };
+}
+
+function applySignalCooldown(data, lockKey) {
+  const now = Date.now();
+  const activeLock = SIGNAL_LOCKS.get(lockKey);
+
+  if (activeLock && activeLock.until <= now) {
+    SIGNAL_LOCKS.delete(lockKey);
+  }
+
+  if (!['BUY', 'SELL'].includes(data.signal)) {
+    return {
+      ...data,
+      cooldown: {
+        active: Boolean(activeLock && activeLock.until > now),
+        secondsRemaining: activeLock && activeLock.until > now
+          ? Math.ceil((activeLock.until - now) / 1000)
+          : 0
+      }
+    };
+  }
+
+  const currentLock = SIGNAL_LOCKS.get(lockKey);
+  if (currentLock && currentLock.until > now) {
+    const secondsRemaining = Math.ceil((currentLock.until - now) / 1000);
+    return {
+      ...data,
+      signal: 'HOLD',
+      strength: 'FAIBLE',
+      confidence: 0,
+      tradePlan: null,
+      cooldown: {
+        active: true,
+        secondsRemaining,
+        lockedSignal: currentLock.signal,
+        lockedAt: new Date(currentLock.createdAt).toISOString()
+      },
+      reasons: [
+        `Signal ${currentLock.signal} deja emis: generation bloquee encore ${secondsRemaining}s`,
+        ...(data.reasons || [])
+      ]
+    };
+  }
+
+  SIGNAL_LOCKS.set(lockKey, {
+    signal: data.signal,
+    createdAt: now,
+    until: now + SIGNAL_COOLDOWN_MS
+  });
+
+  return {
+    ...data,
+    cooldown: {
+      active: true,
+      secondsRemaining: SIGNAL_COOLDOWN_MS / 1000,
+      lockedSignal: data.signal,
+      lockedAt: new Date(now).toISOString()
+    }
+  };
+}
+
+// ================= ROOT
+app.get('/', (req, res) => {
+  res.json({
+    status: 'ok',
+    message: 'Trading backend is running'
   });
 });
 
-app.get("/api/locks", (req, res) => {
-  const now = Date.now();
-  const activeLocks = [];
-  for (const [key, lock] of SIGNAL_LOCKS.entries()) {
-    if (now > lock.expiresAt) {
-      SIGNAL_LOCKS.delete(key);
-      continue;
-    }
-    const secondsRemaining = Math.max(0, Math.round((lock.expiresAt - now) / 1000));
-    activeLocks.push({
-      key,
-      signal: lock.signal,
-      confidence: lock.confidence,
-      score: lock.score,
-      lockedAt: new Date(lock.lockedAt).toISOString(),
-      expiresAt: new Date(lock.expiresAt).toISOString(),
-      secondsRemaining,
-      countdown: `${Math.floor(secondsRemaining / 60)}:${String(secondsRemaining % 60).padStart(2, "0")}`,
-      tradePlan: lock.tradePlan
-    });
-  }
-  res.json({ activeLocks, count: activeLocks.length });
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    uptime: round(process.uptime(), 2),
+    timestamp: new Date().toISOString()
+  });
 });
 
-app.post("/api/reset-lock", (req, res) => {
-  const { key } = req.body;
-  if (key && SIGNAL_LOCKS.has(key)) {
-    SIGNAL_LOCKS.delete(key);
-    res.json({ status: "success", message: `Verrou [${key}] libéré avec succès.` });
-  } else {
-    res.status(404).json({ status: "error", message: "Clé de verrouillage introuvable ou déjà expirée." });
-  }
-});
-
-// ROUTE DU FILTRAGE DU MARCHÉ STABILISE (PRINCIPALE)
-app.get("/api/market", async (req, res) => {
+// ================= MARKET ROUTE
+app.get('/market', async (req, res) => {
   try {
-    const symbol = req.query.symbol;
-    const type = req.query.type || "crypto";
-    const interval = req.query.interval || "15m";
-    const news = req.query.news || "";
-    const provider = req.query.provider || "";
+    let {
+      symbol,
+      type = 'crypto',
+      interval = '15m',
+      news = '',
+      provider = ''
+    } = req.query;
 
     if (!symbol) {
-      return res.status(400).json({ error: "Le paramètre 'symbol' est requis" });
+      return res.status(400).json({ error: 'Symbol requis' });
     }
 
-    const sym = String(symbol).trim();
-    const t = String(type).toLowerCase().trim();
-    const cleanType = (t === "indice" || t === "indices") ? "index" : t;
-    
-    let targetInterval = String(interval);
-    if (!INTERVAL_MAP[targetInterval]) {
-      targetInterval = "15m";
+    symbol = String(symbol).trim();
+    type = String(type).toLowerCase().trim();
+
+    if (type === 'indice') type = 'index';
+    if (type === 'indices') type = 'index';
+
+    if (!INTERVAL_MAP[interval]) {
+      interval = '15m';
     }
 
-    const timeConfig = INTERVAL_MAP[targetInterval];
-    const cacheKey = `${cleanType}-${sym}-${targetInterval}-${provider}`;
-    const lockKey = `${cleanType}-${compactSymbol(sym)}-${targetInterval}`;
+    const timeConfig = INTERVAL_MAP[interval];
+    const cacheKey = `${type}-${symbol}-${interval}-${provider}`;
+    const signalLockKey = `${type}-${compactSymbol(symbol)}-${interval}-${provider}`;
 
-    // OPTIMISATION CACHE : Si les données en cache sont valides, renvoyer immédiatement
-    const cachedItem = CACHE.get(cacheKey);
-    if (cachedItem && (Date.now() - cachedItem.timestamp < timeConfig.cache)) {
-      return res.json(cachedItem.data);
-    }
-
-    let candles = [];
-    let currentPrice = 0;
-    let source = "";
-
-    try {
-      const fetched = await fetchMarketData({ symbol: sym, type: cleanType, timeConfig, provider: String(provider) });
-      candles = fetched.candles;
-      currentPrice = fetched.currentPrice;
-      source = fetched.source;
-    } catch (fetchErr) {
-      if (cachedItem) {
-        candles = cachedItem.data.candles || [];
-        currentPrice = cachedItem.data.marketPrice || 0;
-        source = `${cachedItem.data.source} (Cache Fallback)`;
-      } else {
-        throw fetchErr;
+    if (CACHE.has(cacheKey)) {
+      const cached = CACHE.get(cacheKey);
+      if (Date.now() - cached.timestamp < timeConfig.cache) {
+        return res.json(applySignalCooldown(cached.data, signalLockKey));
       }
     }
 
-    if (!candles || candles.length < 60) {
+    const market = await fetchMarketData({
+      symbol,
+      type,
+      timeConfig,
+      provider
+    });
+
+    if (!market.candles || market.candles.length < 60) {
       return res.status(404).json({
-        error: "Données de marché insuffisantes pour ce symbole. 60 bougies minimum requises.",
-        candles: candles?.length || 0,
-        source
+        error: 'Donnees insuffisantes',
+        source: market.source,
+        candles: market.candles?.length || 0
       });
     }
 
-    const freshAnalysis = runSignalEngine(candles, String(news));
-    const stabilizedResult = resolveStabilizedSignal(lockKey, freshAnalysis);
+    const closes = market.candles.map(c => c.close);
+    const currentPrice =
+      Number.isFinite(market.currentPrice) && market.currentPrice > 0
+        ? market.currentPrice
+        : median(closes.slice(-3));
+
+    const candles = applyCurrentPrice(market.candles, currentPrice);
+    const analysis = generateScalpingSignal(candles, {
+      news,
+      intervalMs: timeConfig.intervalMs
+    });
 
     const data = {
-      symbol: compactSymbol(sym),
-      type: cleanType,
-      interval: targetInterval,
+      symbol: compactSymbol(symbol),
+      type,
+      interval,
       marketPrice: currentPrice,
       formattedPrice: formatPrice(currentPrice),
-      source,
-      candles: candles.slice(-80),
-      ...stabilizedResult,
+      source: market.source,
+      priceMode:
+        type === 'crypto'
+          ? 'OHLC + ticker natifs de l exchange, alignes avec TradingView si le meme exchange/symbole est choisi'
+          : 'Yahoo Finance chart + regularMarketPrice',
+      ...analysis,
       timestamp: new Date().toISOString()
     };
 
-    CACHE.set(cacheKey, { data, rawAnalysis: freshAnalysis, timestamp: Date.now() });
+    CACHE.set(cacheKey, { data, timestamp: Date.now() });
 
-    return res.json(data);
-
+    return res.json(applySignalCooldown(data, signalLockKey));
   } catch (error) {
-    console.error("Erreur serveur dans /api/market :", error.message);
+    console.error('Market error:', error.message);
     return res.status(502).json({
-      error: "Impossible d'extraire les informations de marché.",
-      details: error.message
+      error: 'Impossible de charger les donnees',
+      details:
+        process.env.NODE_ENV === 'production'
+          ? undefined
+          : error.message
     });
   }
 });
 
-// ============================================================
-// INTEGRATION ET LANCEMENT DU FRONTEND
-// ============================================================
-async function launchFullStack() {
-  if (process.env.NODE_ENV !== "production") {
-    console.log("[DevServer] Chargement de Vite Dev Server en middleware...");
-    const { createServer: createViteServer } = await import("vite");
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa"
-    });
-    
-    app.use(vite.middlewares);
-  } else {
-    console.log("[ProdServer] Hébergement du build statique depuis /dist...");
-    const distPath = path.join(process.cwd(), "dist");
-    
-    app.use(express.static(distPath));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
-    });
-  }
-
-  app.listen(PORT, HOST, () => {
-    console.log(`\n======================================================`);
-    console.log(`🟢 SERVER RUNNING AT http://localhost:${PORT}`);
-    console.log(`🤖 Moteur de Trading Stabilisé Activé`);
-    console.log(`⏱️ Période de verrouillage forcée : ${SIGNAL_LOCK_MS / 1000}s (3 minutes)`);
-    console.log(`🎯 Seuil minimum de confiance requis : 70%`);
-    console.log(`🏠 Mode host : ${HOST}`);
-    console.log(`======================================================\n`);
-  });
-}
-
-launchFullStack().catch(err => {
-  console.error("Échec de l'initialisation du serveur Full-Stack :", err);
+app.listen(PORT, HOST, () => {
+  console.log(`Serveur lance sur ${HOST}:${PORT}`);
 });
