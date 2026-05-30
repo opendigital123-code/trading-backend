@@ -1,4 +1,4 @@
-import express, { Request, Response } from "express";
+import express from "express";
 import path from "path";
 import fs from "fs";
 import cors from "cors";
@@ -56,19 +56,7 @@ app.use("/api/market", rateLimit({
 // ============================================================
 // CONFIGURATION DES INTERVALLES & CONFIGS TECHNIQUES
 // ============================================================
-interface IntervalConfig {
-  binance: string;
-  bybit: string;
-  yahooInt: string;
-  yahooRange: string;
-  coinbaseGranularity: number | null;
-  bitstampStep: number | null;
-  bitstampAggregateMs?: number;
-  aggregateMs?: number;
-  cache: number;
-}
-
-const INTERVAL_MAP: Record<string, IntervalConfig> = {
+const INTERVAL_MAP = {
   "1m":  { binance: "1m",  bybit: "15",  yahooInt: "1m",  yahooRange: "5d",   coinbaseGranularity: 60,    bitstampStep: 60,    cache: 10000 },
   "5m":  { binance: "5m",  bybit: "5",   yahooInt: "5m",  yahooRange: "15d",  coinbaseGranularity: 300,   bitstampStep: 300,   cache: 15000 },
   "15m": { binance: "15m", bybit: "15",  yahooInt: "15m", yahooRange: "30d",  coinbaseGranularity: 900,   bitstampStep: 900,   cache: 20000 },
@@ -78,7 +66,7 @@ const INTERVAL_MAP: Record<string, IntervalConfig> = {
   "1d":  { binance: "1d",  bybit: "D",   yahooInt: "1d",  yahooRange: "1y",   coinbaseGranularity: 86400, bitstampStep: 86400, cache: 120000 },
 };
 
-const YAHOO_SYMBOL_ALIASES: Record<string, string> = {
+const YAHOO_SYMBOL_ALIASES = {
   US100: "^NDX", NAS100: "^NDX", NASDAQ100: "^NDX", NDX100: "^NDX",
   USTECH100: "^NDX", USTEC: "^NDX", TECH100: "^NDX",
   "US TECH 100": "^NDX", "NASDAQ 100": "^NDX",
@@ -95,43 +83,12 @@ const YAHOO_SYMBOL_ALIASES: Record<string, string> = {
 const SIGNAL_LOCK_MS = Number(process.env.SIGNAL_LOCK_MS || 3 * 60 * 1000);
 const LOCKS_DUMP_FILE = process.env.LOCKS_DUMP_FILE || path.join("/tmp", ".signal_locks_ts.json");
 
-interface TradePlan {
-  action: string;
-  entry: string | null;
-  entryZone: string;
-  stopLoss: string | null;
-  sl: string | null;
-  takeProfit1: string | null;
-  takeProfit2: string | null;
-  takeProfit3: string | null;
-  tp1: string | null;
-  tp2: string | null;
-  tp3: string | null;
-  takeProfit: (string | null)[];
-  targets: (string | null)[];
-  support: string | null;
-  resistance: string | null;
-  invalidation: string | null;
-  riskReward: { tp1: number; tp2: number; tp3: number };
-  exitPlan: string;
-}
-
-interface SignalLock {
-  signal: string;
-  confidence: number;
-  score: number;
-  lockedAt: number;
-  expiresAt: number;
-  tradePlan: TradePlan;
-  reasons: string[];
-}
-
-const SIGNAL_LOCKS = new Map<string, SignalLock>();
+const SIGNAL_LOCKS = new Map();
 
 function dumpLocks() {
   try {
     const now = Date.now();
-    const active: [string, SignalLock][] = [];
+    const active = [];
     for (const [key, lock] of SIGNAL_LOCKS.entries()) {
       if (now <= lock.expiresAt) active.push([key, lock]);
     }
@@ -142,7 +99,7 @@ function dumpLocks() {
 function loadLocks() {
   try {
     if (!fs.existsSync(LOCKS_DUMP_FILE)) return;
-    const data = JSON.parse(fs.readFileSync(LOCKS_DUMP_FILE, "utf8")) as [string, SignalLock][];
+    const data = JSON.parse(fs.readFileSync(LOCKS_DUMP_FILE, "utf8"));
     const now = Date.now();
     for (const [key, lock] of data) {
       if (lock.expiresAt > now) SIGNAL_LOCKS.set(key, lock);
@@ -156,7 +113,7 @@ loadLocks();
 process.on("SIGTERM", () => { dumpLocks(); process.exit(0); });
 process.on("SIGINT",  () => { dumpLocks(); process.exit(0); });
 
-function getLockedSignal(key: string): SignalLock | null {
+function getLockedSignal(key) {
   const lock = SIGNAL_LOCKS.get(key);
   if (!lock) return null;
   if (Date.now() > lock.expiresAt) {
@@ -169,85 +126,72 @@ function getLockedSignal(key: string): SignalLock | null {
 // ============================================================
 // SYSTEME DE CACHE LRU POUR LES CANDELESTICKS
 // ============================================================
-class LRUCache<T> {
-  private maxSize: number;
-  private map: Map<string, T>;
-  constructor(maxSize: number) {
+class LRUCache {
+  constructor(maxSize) {
     this.maxSize = maxSize;
     this.map = new Map();
   }
-  get(key: string): T | undefined { return this.map.get(key); }
-  has(key: string): boolean { return this.map.has(key); }
-  set(key: string, value: T): void {
+  get(key) { return this.map.get(key); }
+  has(key) { return this.map.has(key); }
+  set(key, value) {
     if (this.map.has(key)) this.map.delete(key);
     this.map.set(key, value);
-    if (this.map.size > this.maxSize) this.map.delete(this.map.keys().next().value!);
+    if (this.map.size > this.maxSize) {
+      const firstKey = this.map.keys().next().value;
+      if (firstKey !== undefined) this.map.delete(firstKey);
+    }
   }
-  get size(): number { return this.map.size; }
+  get size() { return this.map.size; }
 }
 
-interface CacheItem {
-  data: any;
-  rawAnalysis: any;
-  timestamp: number;
-}
-const CACHE = new LRUCache<CacheItem>(200);
+const CACHE = new LRUCache(200);
 
 // ============================================================
 // UTILITIES MATHEMATIQUES ET CHANDELIERS
 // ============================================================
-function round(value: number, digits = 4): number {
+function round(value, digits = 4) {
   if (!Number.isFinite(value)) return 0;
   return Number(value.toFixed(digits));
 }
-function average(values: number[]): number {
+function average(values) {
   const valid = values.filter(Number.isFinite);
   if (!valid.length) return 0;
   return valid.reduce((s, v) => s + v, 0) / valid.length;
 }
-function median(values: number[]): number {
+function median(values) {
   const valid = values.filter(Number.isFinite).sort((a, b) => a - b);
   if (!valid.length) return 0;
   const mid = Math.floor(valid.length / 2);
   return valid.length % 2 ? valid[mid] : (valid[mid - 1] + valid[mid]) / 2;
 }
-function stdDev(values: number[]): number {
+function stdDev(values) {
   const valid = values.filter(Number.isFinite);
   if (valid.length < 2) return 0;
   const mean = average(valid);
   return Math.sqrt(valid.reduce((s, v) => s + (v - mean) ** 2, 0) / valid.length);
 }
-function clamp(value: number, min: number, max: number): number {
+function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
-function formatPrice(value: number): string {
+function formatPrice(value) {
   const abs = Math.abs(value);
   if (abs >= 1000) return Number(value.toFixed(2)).toLocaleString("en-US");
   if (abs >= 1)    return Number(value.toFixed(4)).toLocaleString("en-US");
   return Number(value.toFixed(8)).toString();
 }
-function priceDigits(value: number): number {
+function priceDigits(value) {
   const abs = Math.abs(value);
   if (abs >= 1000) return 2;
   if (abs >= 1)    return 4;
   return 8;
 }
-function formatPlanPrice(value: number, reference: number): string {
+function formatPlanPrice(value, reference) {
   const ref = Number.isFinite(reference) ? reference : value;
   return round(value, priceDigits(ref)).toString();
 }
 
-interface Candle {
-  time: number;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume: number;
-}
-
 // INDICATEURS TECHNIQUES
-function calculateRSI(prices: number[], period = 14): number {
+function calculateRSI(prices, period = 14) {
   if (prices.length <= period) return 50;
   let avgGain = 0, avgLoss = 0;
   for (let i = 1; i <= period; i++) {
@@ -266,7 +210,7 @@ function calculateRSI(prices: number[], period = 14): number {
   return 100 - 100 / (1 + avgGain / avgLoss);
 }
 
-function calculateRSISeries(prices: number[], period = 14): (number | null)[] {
+function calculateRSISeries(prices, period = 14) {
   const result = new Array(prices.length).fill(null);
   if (prices.length <= period) return result;
   let avgGain = 0, avgLoss = 0;
@@ -287,21 +231,21 @@ function calculateRSISeries(prices: number[], period = 14): (number | null)[] {
   return result;
 }
 
-function calculateStochRSI(prices: number[], rsiPeriod = 14, stochPeriod = 14, kSmooth = 3, dSmooth = 3) {
+function calculateStochRSI(prices, rsiPeriod = 14, stochPeriod = 14, kSmooth = 3, dSmooth = 3) {
   const rsiSeries = calculateRSISeries(prices, rsiPeriod);
-  const validRsi = rsiSeries.filter((v): v is number => v !== null);
+  const validRsi = rsiSeries.filter(v => v !== null);
   if (validRsi.length < stochPeriod) return { k: 50, d: 50, kPrev: 50, dPrev: 50 };
-  const stochSeries: number[] = [];
+  const stochSeries = [];
   for (let i = stochPeriod - 1; i < validRsi.length; i++) {
     const window = validRsi.slice(i - stochPeriod + 1, i + 1);
     const lo = Math.min(...window), hi = Math.max(...window);
     stochSeries.push(hi === lo ? 50 : ((validRsi[i] - lo) / (hi - lo)) * 100);
   }
-  const kSeries: number[] = [];
+  const kSeries = [];
   for (let i = kSmooth - 1; i < stochSeries.length; i++) {
     kSeries.push(average(stochSeries.slice(i - kSmooth + 1, i + 1)));
   }
-  const dSeries: number[] = [];
+  const dSeries = [];
   for (let i = dSmooth - 1; i < kSeries.length; i++) {
     dSeries.push(average(kSeries.slice(i - dSmooth + 1, i + 1)));
   }
@@ -313,7 +257,7 @@ function calculateStochRSI(prices: number[], rsiPeriod = 14, stochPeriod = 14, k
   };
 }
 
-function calculateEMA(prices: number[], period: number): number[] {
+function calculateEMA(prices, period) {
   if (prices.length < period) {
     return prices.map(() => prices[prices.length - 1] || 0);
   }
@@ -328,7 +272,7 @@ function calculateEMA(prices: number[], period: number): number[] {
   return result;
 }
 
-function calculateMACD(prices: number[], fast = 12, slow = 26, signal = 9) {
+function calculateMACD(prices, fast = 12, slow = 26, signal = 9) {
   const emaFast = calculateEMA(prices, fast);
   const emaSlow = calculateEMA(prices, slow);
   const macdLine = prices.map((_, i) => {
@@ -349,9 +293,9 @@ function calculateMACD(prices: number[], fast = 12, slow = 26, signal = 9) {
   return { macd: lastMacd, signal: lastSig, histogram: lastMacd - lastSig, prevHistogram: prevMacd - prevSigVal, bullCross, bearCross };
 }
 
-function calculateATR(candles: Candle[], period = 14): number {
+function calculateATR(candles, period = 14) {
   if (candles.length <= period) return 0;
-  const tr: number[] = [];
+  const tr = [];
   for (let i = 1; i < candles.length; i++) {
     const c = candles[i], p = candles[i - 1];
     tr.push(Math.max(c.high - c.low, Math.abs(c.high - p.close), Math.abs(c.low - p.close)));
@@ -359,7 +303,7 @@ function calculateATR(candles: Candle[], period = 14): number {
   return average(tr.slice(-period));
 }
 
-function calculateBollingerBands(prices: number[], period = 20, multiplier = 2) {
+function calculateBollingerBands(prices, period = 20, multiplier = 2) {
   if (prices.length < period) {
     const last = prices[prices.length - 1] || 0;
     return { upper: last, middle: last, lower: last, width: 0, percentB: 0.5, std: 0 };
@@ -375,10 +319,10 @@ function calculateBollingerBands(prices: number[], period = 20, multiplier = 2) 
   return { upper, middle, lower, width, percentB, std };
 }
 
-function calculateVWAP(candles: Candle[], period = 30) {
+function calculateVWAP(candles, period = 30) {
   const recent = candles.slice(-period);
   let pv = 0, vol = 0;
-  const typicals: number[] = [];
+  const typicals = [];
   for (const c of recent) {
     const typical = (c.high + c.low + c.close) / 3;
     pv += typical * c.volume;
@@ -393,9 +337,9 @@ function calculateVWAP(candles: Candle[], period = 30) {
   return { vwap, upper1: vwap + std, lower1: vwap - std, upper2: vwap + 2 * std, lower2: vwap - 2 * std };
 }
 
-function calculateSupportResistance(candles: Candle[], lookback = 60, swingStrength = 3) {
+function calculateSupportResistance(candles, lookback = 60, swingStrength = 3) {
   const recent = candles.slice(-lookback);
-  const swingHighs: number[] = [], swingLows: number[] = [];
+  const swingHighs = [], swingLows = [];
   for (let i = swingStrength; i < recent.length - swingStrength; i++) {
     const pivot = recent[i];
     const isHigh = recent.slice(i - swingStrength, i + swingStrength + 1).every((c, j) => j === swingStrength || c.high <= pivot.high);
@@ -415,28 +359,18 @@ function calculateSupportResistance(candles: Candle[], lookback = 60, swingStren
 }
 
 // DETECTOR DE CHANDELIERS ET DE BOUGIES DE CONFIRMATION AVANCE
-interface PatternResult {
-  bullish: string[];
-  bearish: string[];
-  bullScore: number;
-  bearScore: number;
-  confirmed: boolean;
-  confirmationDetails: string[];
-  volatilityRating: string;
-}
-
-function detectCandlePatternsAndConfirmations(candles: Candle[], atrPercent: number): PatternResult {
+function detectCandlePatternsAndConfirmations(candles, atrPercent) {
   const n = candles.length;
   if (n < 5) return { bullish: [], bearish: [], bullScore: 0, bearScore: 0, confirmed: false, confirmationDetails: [], volatilityRating: "MODEREE" };
 
-  const bullish: string[] = [];
-  const bearish: string[] = [];
-  const confirmationDetails: string[] = [];
+  const bullish = [];
+  const bearish = [];
+  const confirmationDetails = [];
   
-  const c0 = candles[candles.length - 1]!;
-  const c1 = candles[candles.length - 2]!;
-  const c2 = candles[candles.length - 3]!;
-  const c3 = candles[candles.length - 4]!;
+  const c0 = candles[candles.length - 1];
+  const c1 = candles[candles.length - 2];
+  const c2 = candles[candles.length - 3];
+  const c3 = candles[candles.length - 4];
 
   const body1 = Math.abs(c1.close - c1.open);
   const range1 = c1.high - c1.low || 0.0001;
@@ -459,8 +393,8 @@ function detectCandlePatternsAndConfirmations(candles: Candle[], atrPercent: num
   const isBull3 = c3.close > c3.open;
 
   const prevCandles = candles.slice(-7, -2);
-  const trendBullish = prevCandles[prevCandles.length - 1]!.close > prevCandles[0].close;
-  const trendBearish = prevCandles[prevCandles.length - 1]!.close < prevCandles[0].close;
+  const trendBullish = prevCandles[prevCandles.length - 1].close > prevCandles[0].close;
+  const trendBearish = prevCandles[prevCandles.length - 1].close < prevCandles[0].close;
 
   const avgBody = average(candles.slice(-15).map(c => Math.abs(c.close - c.open)));
   const avgRange = average(candles.slice(-15).map(c => c.high - c.low));
@@ -632,7 +566,7 @@ function detectCandlePatternsAndConfirmations(candles: Candle[], atrPercent: num
 }
 
 // FORMATTEUR DE PLAN DE TRADING ET POSITION SIZING
-function createTradingPlan(signal: string, confidence: number, score: number, price: number, atr: number, support: number, resistance: number, percentB: number): TradePlan {
+function createTradingPlan(signal, confidence, score, price, atr, support, resistance, percentB) {
   const direction = signal === "SELL" || (signal === "HOLD" && score < 0) ? "SELL" : "BUY";
   const isBuy = direction === "BUY";
   
@@ -701,7 +635,7 @@ function createTradingPlan(signal: string, confidence: number, score: number, pr
 }
 
 // GENERATION COMPLETE DE SIGNAL
-function runSignalEngine(candles: Candle[], news = ""): any {
+function runSignalEngine(candles, news = "") {
   const MIN_CANDLES = 60;
   if (candles.length < MIN_CANDLES) {
     return {
@@ -717,7 +651,7 @@ function runSignalEngine(candles: Candle[], news = ""): any {
   }
 
   const closes = candles.map(c => c.close);
-  const last = candles[candles.length - 1]!;
+  const last = candles[candles.length - 1];
   const currentPrice = last.close;
 
   // Optimisation CPU : Calcul des EMA exécuté une seule fois par variable
@@ -748,7 +682,7 @@ function runSignalEngine(candles: Candle[], news = ""): any {
 
   const patternResult = detectCandlePatternsAndConfirmations(candles, atrPercent);
 
-  const reasons: string[] = [];
+  const reasons = [];
   let bullConfidence = 0;
   let bearConfidence = 0;
   let confirmations = 0;
@@ -913,7 +847,7 @@ function runSignalEngine(candles: Candle[], news = ""): any {
     reasons.push(`Signal de trading [${signal}] validé avec succès avec ${confidence}% de confiance.`);
   }
 
-  function strengthFromConfidence(conf: number) {
+  function strengthFromConfidence(conf) {
     if (conf >= 85) return "EXTREME";
     if (conf >= 70) return "FORTE";
     if (conf >= 55) return "MOYENNE";
@@ -966,13 +900,13 @@ function runSignalEngine(candles: Candle[], news = ""): any {
   };
 }
 
-function resolveStabilizedSignal(key: string, freshAnalysis: any): any {
+function resolveStabilizedSignal(key, freshAnalysis) {
   const now = Date.now();
   const existing = getLockedSignal(key);
 
   if (!existing) {
     if (freshAnalysis.signal !== "HOLD" && freshAnalysis.confidence >= 70) {
-      const lock: SignalLock = {
+      const lock = {
         signal:      freshAnalysis.signal,
         confidence:  freshAnalysis.confidence,
         score:       freshAnalysis.score,
@@ -990,7 +924,7 @@ function resolveStabilizedSignal(key: string, freshAnalysis: any): any {
   return buildLockedResponse(existing, freshAnalysis, now);
 }
 
-function buildLockedResponse(lock: SignalLock | null, freshAnalysis: any, now: number) {
+function buildLockedResponse(lock, freshAnalysis, now) {
   const isLocked = lock !== null;
   const secondsRemaining = isLocked ? Math.max(0, Math.round((lock.expiresAt - now) / 1000)) : 0;
   const minutesRemaining = Math.floor(secondsRemaining / 60);
@@ -1019,7 +953,7 @@ function buildLockedResponse(lock: SignalLock | null, freshAnalysis: any, now: n
 }
 
 // ─── ACCES AUX API DE MARCHÉ ET NORMALISATION ─────────────────────────
-function normalizeCandles(candles: any[]): Candle[] {
+function normalizeCandles(candles) {
   return candles
     .map(c => ({
       time:   Number(c.time),
@@ -1037,29 +971,29 @@ function normalizeCandles(candles: any[]): Candle[] {
     .sort((a, b) => a.time - b.time);
 }
 
-function applyCurrentPrice(candles: Candle[], currentPrice: number): Candle[] {
+function applyCurrentPrice(candles, currentPrice) {
   if (!candles.length || !Number.isFinite(currentPrice) || currentPrice <= 0) return candles;
   const updated = candles.map(c => ({ ...c }));
-  const last = updated[updated.length - 1]!;
+  const last = updated[updated.length - 1];
   last.close = currentPrice;
   last.high  = Math.max(last.high, currentPrice);
   last.low   = Math.min(last.low,  currentPrice);
   return updated;
 }
 
-function splitTradingViewSymbol(rawSymbol: string) {
+function splitTradingViewSymbol(rawSymbol) {
   const raw = String(rawSymbol || "").trim();
   const parts = raw.split(":");
   if (parts.length > 1) return { exchange: parts[0].toLowerCase(), symbol: parts.slice(1).join(":") };
   return { exchange: "", symbol: raw };
 }
 
-function compactSymbol(symbol: string): string {
+function compactSymbol(symbol) {
   return String(symbol || "").toUpperCase().trim()
     .replace(/\s+/g, " ").replace(/\.P$/, "").replace(/PERP$/, "");
 }
 
-function normalizeCryptoPair(rawSymbol: string) {
+function normalizeCryptoPair(rawSymbol) {
   const { exchange, symbol } = splitTradingViewSymbol(rawSymbol);
   const cleaned  = compactSymbol(symbol).replace(/[-/_\s]/g, "").replace(/[^A-Z0-9]/g, "");
   const quotes   = ["USDT", "USDC", "BUSD", "USD", "EUR", "BTC", "ETH"];
@@ -1077,7 +1011,7 @@ function normalizeCryptoPair(rawSymbol: string) {
   };
 }
 
-function resolveYahooSymbol(rawSymbol: string, type: string): string {
+function resolveYahooSymbol(rawSymbol, type) {
   const { symbol } = splitTradingViewSymbol(rawSymbol);
   const normalized = compactSymbol(symbol);
   const aliasKey   = normalized.replace(/[-/_^=.\s]/g, "");
@@ -1090,7 +1024,7 @@ function resolveYahooSymbol(rawSymbol: string, type: string): string {
 }
 
 // FETCH DE DONNÉES BINANCE SPOT
-async function fetchBinanceCrypto(pair: any, timeConfig: IntervalConfig) {
+async function fetchBinanceCrypto(pair, timeConfig) {
   const [klinesResponse, tickerResponse] = await Promise.all([
     HTTP.get("https://api.binance.com/api/v3/klines", {
       params: { symbol: pair.binanceSymbol, interval: timeConfig.binance, limit: 300 }
@@ -1100,7 +1034,7 @@ async function fetchBinanceCrypto(pair: any, timeConfig: IntervalConfig) {
     }).catch(() => null)
   ]);
   
-  const rawCandles = klinesResponse.data.map((c: any) => ({
+  const rawCandles = klinesResponse.data.map(c => ({
     time: c[0], open: c[1], high: c[2], low: c[3], close: c[4], volume: c[5]
   }));
   const candles = normalizeCandles(rawCandles);
@@ -1109,13 +1043,13 @@ async function fetchBinanceCrypto(pair: any, timeConfig: IntervalConfig) {
 }
 
 // FETCH DE DONNÉES BYBIT SPOT
-async function fetchBybitCrypto(pair: any, timeConfig: IntervalConfig) {
+async function fetchBybitCrypto(pair, timeConfig) {
   const response = await HTTP.get("https://api.bybit.com/v5/market/kline", {
     params: { category: "spot", symbol: pair.bybitSymbol, interval: timeConfig.bybit, limit: 200 }
   });
   if (response.data?.retCode !== 0) throw new Error(response.data?.retMsg || "Bybit error");
   
-  const rawCandles = (response.data?.result?.list || []).map((c: any) => ({
+  const rawCandles = (response.data?.result?.list || []).map(c => ({
     time: Number(c[0]), open: c[1], high: c[2], low: c[3], close: c[4], volume: c[5]
   }));
   const candles = normalizeCandles(rawCandles);
@@ -1123,7 +1057,7 @@ async function fetchBybitCrypto(pair: any, timeConfig: IntervalConfig) {
 }
 
 // FETCH DE DONNÉES COINBASE PRO
-async function fetchCoinbaseCrypto(pair: any, timeConfig: IntervalConfig) {
+async function fetchCoinbaseCrypto(pair, timeConfig) {
   if (!timeConfig.coinbaseGranularity) throw new Error("Intervalle non supporté par Coinbase");
   const end = Math.floor(Date.now() / 1000);
   const start = end - timeConfig.coinbaseGranularity * 250;
@@ -1137,7 +1071,7 @@ async function fetchCoinbaseCrypto(pair: any, timeConfig: IntervalConfig) {
     }),
     HTTP.get(`https://api.exchange.coinbase.com/products/${pair.coinbaseProduct}/ticker`).catch(() => null)
   ]);
-  const rawCandles = (response.data || []).map((c: any) => ({
+  const rawCandles = (response.data || []).map(c => ({
     time: c[0] * 1000, low: c[1], high: c[2], open: c[3], close: c[4], volume: c[5]
   }));
   const candles = normalizeCandles(rawCandles);
@@ -1146,17 +1080,17 @@ async function fetchCoinbaseCrypto(pair: any, timeConfig: IntervalConfig) {
 }
 
 // LAUNCHERS SELECTOR
-async function fetchCryptoMarket(rawSymbol: string, timeConfig: IntervalConfig, preferredProvider = "") {
+async function fetchCryptoMarket(rawSymbol, timeConfig, preferredProvider = "") {
   const pair = normalizeCryptoPair(rawSymbol);
   const order = preferredProvider === "bybit" ? ["bybit", "binance", "coinbase"] : ["binance", "bybit", "coinbase"];
-  const errors: string[] = [];
+  const errors = [];
   
   for (const provider of order) {
     try {
       if (provider === "binance") return await fetchBinanceCrypto(pair, timeConfig);
       if (provider === "bybit") return await fetchBybitCrypto(pair, timeConfig);
       if (provider === "coinbase") return await fetchCoinbaseCrypto(pair, timeConfig);
-    } catch (e: any) {
+    } catch (e) {
       errors.push(`${provider} : ${e.message}`);
     }
   }
@@ -1164,14 +1098,14 @@ async function fetchCryptoMarket(rawSymbol: string, timeConfig: IntervalConfig, 
 }
 
 // FETCH TRADITIONNEL VIA YAHOO FINANCE
-async function fetchYahooMarket(rawSymbol: string, type: string, timeConfig: IntervalConfig) {
+async function fetchYahooMarket(rawSymbol, type, timeConfig) {
   const yahooSymbol = resolveYahooSymbol(rawSymbol, type);
   const endpoints = [
     `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}`,
     `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}`
   ];
 
-  let lastError: any;
+  let lastError;
   for (const url of endpoints) {
     try {
       const response = await HTTP.get(url, {
@@ -1193,7 +1127,7 @@ async function fetchYahooMarket(rawSymbol: string, type: string, timeConfig: Int
       const timestamps = result?.timestamp || [];
       if (!quote) throw new Error("Yahoo Finance quote vide");
       
-      const candles = normalizeCandles(timestamps.map((t: number, i: number) => ({
+      const candles = normalizeCandles(timestamps.map((t, i) => ({
         time: t * 1000,
         open: quote.open?.[i],
         high: quote.high?.[i],
@@ -1210,7 +1144,7 @@ async function fetchYahooMarket(rawSymbol: string, type: string, timeConfig: Int
   throw lastError || new Error("Yahoo Finance inaccessible ou indisponible");
 }
 
-async function fetchMarketData({ symbol, type, timeConfig, provider }: { symbol: string; type: string; timeConfig: IntervalConfig; provider: string }) {
+async function fetchMarketData({ symbol, type, timeConfig, provider }) {
   if (type === "crypto") return fetchCryptoMarket(symbol, timeConfig, provider);
   return fetchYahooMarket(symbol, type, timeConfig);
 }
@@ -1219,7 +1153,7 @@ async function fetchMarketData({ symbol, type, timeConfig, provider }: { symbol:
 // ROUTES DE L'API REST
 // ============================================================
 
-app.get("/api/health", (req: Request, res: Response) => {
+app.get("/api/health", (req, res) => {
   res.json({
     status: "ok",
     uptime: round(process.uptime(), 2),
@@ -1233,9 +1167,9 @@ app.get("/api/health", (req: Request, res: Response) => {
   });
 });
 
-app.get("/api/locks", (req: Request, res: Response) => {
+app.get("/api/locks", (req, res) => {
   const now = Date.now();
-  const activeLocks: any[] = [];
+  const activeLocks = [];
   for (const [key, lock] of SIGNAL_LOCKS.entries()) {
     if (now > lock.expiresAt) {
       SIGNAL_LOCKS.delete(key);
@@ -1257,7 +1191,7 @@ app.get("/api/locks", (req: Request, res: Response) => {
   res.json({ activeLocks, count: activeLocks.length });
 });
 
-app.post("/api/reset-lock", (req: Request, res: Response) => {
+app.post("/api/reset-lock", (req, res) => {
   const { key } = req.body;
   if (key && SIGNAL_LOCKS.has(key)) {
     SIGNAL_LOCKS.delete(key);
@@ -1268,7 +1202,7 @@ app.post("/api/reset-lock", (req: Request, res: Response) => {
 });
 
 // ROUTE DU FILTRAGE DU MARCHÉ STABILISE (PRINCIPALE)
-app.get("/api/market", async (req: Request, res: Response) => {
+app.get("/api/market", async (req, res) => {
   try {
     const symbol = req.query.symbol;
     const type = req.query.type || "crypto";
@@ -1293,13 +1227,13 @@ app.get("/api/market", async (req: Request, res: Response) => {
     const cacheKey = `${cleanType}-${sym}-${targetInterval}-${provider}`;
     const lockKey = `${cleanType}-${compactSymbol(sym)}-${targetInterval}`;
 
-    // OPTIMISATION CACHE : Si les données en cache sont valides, renvoyer la réponse immédiatement.
+    // OPTIMISATION CACHE : Si les données en cache sont valides, renvoyer immédiatement
     const cachedItem = CACHE.get(cacheKey);
     if (cachedItem && (Date.now() - cachedItem.timestamp < timeConfig.cache)) {
       return res.json(cachedItem.data);
     }
 
-    let candles: Candle[] = [];
+    let candles = [];
     let currentPrice = 0;
     let source = "";
 
@@ -1308,7 +1242,7 @@ app.get("/api/market", async (req: Request, res: Response) => {
       candles = fetched.candles;
       currentPrice = fetched.currentPrice;
       source = fetched.source;
-    } catch (fetchErr: any) {
+    } catch (fetchErr) {
       if (cachedItem) {
         candles = cachedItem.data.candles || [];
         currentPrice = cachedItem.data.marketPrice || 0;
@@ -1345,7 +1279,7 @@ app.get("/api/market", async (req: Request, res: Response) => {
 
     return res.json(data);
 
-  } catch (error: any) {
+  } catch (error) {
     console.error("Erreur serveur dans /api/market :", error.message);
     return res.status(502).json({
       error: "Impossible d'extraire les informations de marché.",
@@ -1372,7 +1306,7 @@ async function launchFullStack() {
     const distPath = path.join(process.cwd(), "dist");
     
     app.use(express.static(distPath));
-    app.get("*", (req: Request, res: Response) => {
+    app.get("*", (req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
