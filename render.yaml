@@ -2,7 +2,10 @@ services:
   - type: web
     name: trading-backend
     runtime: node
-    plan: free
     buildCommand: npm install
-    startCommand: npm start
-    healthCheckPath: /health
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
