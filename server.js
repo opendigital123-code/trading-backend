@@ -1,11 +1,10 @@
-import express from "express";
+import express, { Request, Response } from "express";
 import path from "path";
 import fs from "fs";
 import cors from "cors";
 import compression from "compression";
 import axios from "axios";
 import { rateLimit } from "express-rate-limit";
-import { createServer as createViteServer } from "vite";
 
 const app = express();
 const PORT = 3000;
@@ -37,8 +36,10 @@ const USER_AGENTS = [
 ];
 let uaIndex = 0;
 HTTP.interceptors.request.use(config => {
-  config.headers["User-Agent"] = USER_AGENTS[uaIndex % USER_AGENTS.length];
-  config.headers["Accept"] = "application/json,text/plain,*/*";
+  if (config.headers) {
+    config.headers["User-Agent"] = USER_AGENTS[uaIndex % USER_AGENTS.length];
+    config.headers["Accept"] = "application/json,text/plain,*/*";
+  }
   uaIndex++;
   return config;
 });
@@ -91,7 +92,7 @@ const YAHOO_SYMBOL_ALIASES: Record<string, string> = {
 // ============================================================
 // SYSTEME DE LOCK POUR LE SIGNAL ET LE PLAN DE TRADING
 // ============================================================
-const SIGNAL_LOCK_MS = Number(process.env.SIGNAL_LOCK_MS || 3 * 60 * 1000); // 3 minutes de gel strict
+const SIGNAL_LOCK_MS = Number(process.env.SIGNAL_LOCK_MS || 3 * 60 * 1000);
 const LOCKS_DUMP_FILE = process.env.LOCKS_DUMP_FILE || path.join("/tmp", ".signal_locks_ts.json");
 
 interface TradePlan {
@@ -220,7 +221,6 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 function formatPrice(value: number): string {
-  if (!Number.isFinite(value)) return "0";
   const abs = Math.abs(value);
   if (abs >= 1000) return Number(value.toFixed(2)).toLocaleString("en-US");
   if (abs >= 1)    return Number(value.toFixed(4)).toLocaleString("en-US");
@@ -306,10 +306,10 @@ function calculateStochRSI(prices: number[], rsiPeriod = 14, stochPeriod = 14, k
     dSeries.push(average(kSeries.slice(i - dSmooth + 1, i + 1)));
   }
   return {
-    k:     kSeries.at(-1) ?? 50,
-    d:     dSeries.at(-1) ?? 50,
-    kPrev: kSeries.at(-2) ?? 50,
-    dPrev: dSeries.at(-2) ?? 50
+    k:     kSeries[kSeries.length - 1] ?? 50,
+    d:     dSeries[dSeries.length - 1] ?? 50,
+    kPrev: kSeries[kSeries.length - 2] ?? 50,
+    dPrev: dSeries[dSeries.length - 2] ?? 50
   };
 }
 
@@ -340,10 +340,10 @@ function calculateMACD(prices: number[], fast = 12, slow = 26, signal = 9) {
     return { macd: 0, signal: 0, histogram: 0, prevHistogram: 0, bullCross: false, bearCross: false };
   }
   const signalLine = calculateEMA(validMacd, signal);
-  const lastMacd = macdLine.at(-1) ?? 0;
-  const lastSig = signalLine.at(-1) ?? 0;
-  const prevMacd = macdLine.at(-2) ?? 0;
-  const prevSigVal = signalLine.at(-2) ?? 0;
+  const lastMacd = macdLine[macdLine.length - 1] ?? 0;
+  const lastSig = signalLine[signalLine.length - 1] ?? 0;
+  const prevMacd = macdLine[macdLine.length - 2] ?? 0;
+  const prevSigVal = signalLine[signalLine.length - 2] ?? 0;
   const bullCross = prevMacd <= prevSigVal && lastMacd > lastSig;
   const bearCross = prevMacd >= prevSigVal && lastMacd < lastSig;
   return { macd: lastMacd, signal: lastSig, histogram: lastMacd - lastSig, prevHistogram: prevMacd - prevSigVal, bullCross, bearCross };
@@ -361,7 +361,7 @@ function calculateATR(candles: Candle[], period = 14): number {
 
 function calculateBollingerBands(prices: number[], period = 20, multiplier = 2) {
   if (prices.length < period) {
-    const last = prices.at(-1) || 0;
+    const last = prices[prices.length - 1] || 0;
     return { upper: last, middle: last, lower: last, width: 0, percentB: 0.5, std: 0 };
   }
   const recent = prices.slice(-period);
@@ -370,7 +370,7 @@ function calculateBollingerBands(prices: number[], period = 20, multiplier = 2) 
   const upper = middle + multiplier * std;
   const lower = middle - multiplier * std;
   const width = upper - lower;
-  const price = prices.at(-1) ?? 0;
+  const price = prices[prices.length - 1] ?? 0;
   const percentB = width > 0 ? (price - lower) / width : 0.5;
   return { upper, middle, lower, width, percentB, std };
 }
@@ -385,7 +385,7 @@ function calculateVWAP(candles: Candle[], period = 30) {
     vol += c.volume;
     typicals.push(typical);
   }
-  const vwap = vol > 0 ? pv / vol : recent.at(-1)?.close || 0;
+  const vwap = vol > 0 ? pv / vol : recent[recent.length - 1]?.close || 0;
   const variance = vol > 0
     ? recent.reduce((s, c, i) => s + c.volume * (typicals[i] - vwap) ** 2, 0) / vol
     : 0;
@@ -403,7 +403,7 @@ function calculateSupportResistance(candles: Candle[], lookback = 60, swingStren
     if (isHigh) swingHighs.push(pivot.high);
     if (isLow)  swingLows.push(pivot.low);
   }
-  const price = candles.at(-1)?.close ?? 0;
+  const price = candles[candles.length - 1]?.close ?? 0;
   const resistances = swingHighs.filter(h => h > price).sort((a, b) => a - b);
   const supports = swingLows.filter(l => l < price).sort((a, b) => b - a);
   return {
@@ -433,13 +433,10 @@ function detectCandlePatternsAndConfirmations(candles: Candle[], atrPercent: num
   const bearish: string[] = [];
   const confirmationDetails: string[] = [];
   
-  // Bougie 0 (Bougie en cours de cloture ou Derniere closed - sert de validation/confirmation immédiate)
-  const c0 = candles.at(-1)!;
-  // Bougie 1 (Bougie du pattern ou signal suspecté)
-  const c1 = candles.at(-2)!;
-  // Bougies de contexte passées
-  const c2 = candles.at(-3)!;
-  const c3 = candles.at(-4)!;
+  const c0 = candles[candles.length - 1]!;
+  const c1 = candles[candles.length - 2]!;
+  const c2 = candles[candles.length - 3]!;
+  const c3 = candles[candles.length - 4]!;
 
   const body1 = Math.abs(c1.close - c1.open);
   const range1 = c1.high - c1.low || 0.0001;
@@ -461,43 +458,37 @@ function detectCandlePatternsAndConfirmations(candles: Candle[], atrPercent: num
   const isBear3 = c3.close < c3.open;
   const isBull3 = c3.close > c3.open;
 
-  // Analyse de tendance locale (comparaison des derniers points de fermeture)
   const prevCandles = candles.slice(-7, -2);
-  const trendBullish = prevCandles.at(-1)!.close > prevCandles[0].close;
-  const trendBearish = prevCandles.at(-1)!.close < prevCandles[0].close;
+  const trendBullish = prevCandles[prevCandles.length - 1]!.close > prevCandles[0].close;
+  const trendBearish = prevCandles[prevCandles.length - 1]!.close < prevCandles[0].close;
 
-  // Tailles moyennes pour calibrer la volatilité et les corps
   const avgBody = average(candles.slice(-15).map(c => Math.abs(c.close - c.open)));
   const avgRange = average(candles.slice(-15).map(c => c.high - c.low));
 
-  // ============================================================
-  // ANALYSE DE VOLATILITÉ DES CHANDELIERS (RCV : Relative Candle Volatility)
-  // ============================================================
   let volatilityRating = "MODEREE";
   const rcv0 = (c0.high - c0.low) / (avgRange || 0.0001);
   const rcv1 = (c1.high - c1.low) / (avgRange || 0.0001);
   const maxRcv = Math.max(rcv0, rcv1);
 
   if (maxRcv > 2.2) {
-    volatilityRating = "EXCESSIF"; // Volatilité erratique / Expansion disproportionnée après news ou anomalie
+    volatilityRating = "EXCESSIF";
   } else if (maxRcv < 0.35) {
-    volatilityRating = "COMPRESSE"; // Compression extrême / Pas de liquidité / Pas d'énergie
+    volatilityRating = "COMPRESSE";
   } else if (maxRcv >= 0.6 && maxRcv <= 1.8) {
-    volatilityRating = "STABLE"; // Volatilité harmonieuse, idéale pour suivre des signaux
+    volatilityRating = "STABLE";
   } else {
-    volatilityRating = "CONTROLEE"; // Volatilité standard modérée
+    volatilityRating = "CONTROLEE";
   }
 
   let bullScore = 0;
   let bearScore = 0;
   let confirmed = false;
 
-  // 1. MARTEAU (HAMMER) / RECOUVREMENT DE TENDANCE BAISSIÈRE (SUPPORT)
+  // 1. MARTEAU (HAMMER)
   if (lowerWick1 >= body1 * 2.2 && upperWick1 <= body1 * 0.4 && range1 > avgRange * 0.6 && trendBearish) {
     bullish.push("Marteau de Support");
     bullScore += 12;
 
-    // CONFIRMATION STRICTE : Bougie 0 doit clore haussière ET dépasser l'open ou le milieu de bougie 1
     if (isBull0 && c0.close > c1.high) {
       bullScore += 18;
       confirmed = true;
@@ -511,12 +502,11 @@ function detectCandlePatternsAndConfirmations(candles: Candle[], atrPercent: num
     }
   }
 
-  // 2. ÉTOILE FILANTE (SHOOTING STAR) / RÉSISTANCE EN TENDANCE HAUSSIÈRE
+  // 2. ÉTOILE FILANTE (SHOOTING STAR)
   if (upperWick1 >= body1 * 2.2 && lowerWick1 <= body1 * 0.4 && range1 > avgRange * 0.6 && trendBullish) {
     bearish.push("Étoile Filante (Shooting Star)");
     bearScore += 12;
 
-    // CONFIRMATION STRICTE : Bougie 0 doit clore baissière ET clore sous le bas de bougie 1
     if (isBear0 && c0.close < c1.low) {
       bearScore += 18;
       confirmed = true;
@@ -535,7 +525,6 @@ function detectCandlePatternsAndConfirmations(candles: Candle[], atrPercent: num
     bullish.push("Avalement Haussier");
     bullScore += 15;
 
-    // CONFIRMATION STRICTE : Bougie 0 continue de clore au-dessus du climax de l'avalement
     if (isBull0 && c0.close > c1.close) {
       bullScore += 15;
       confirmed = true;
@@ -550,7 +539,6 @@ function detectCandlePatternsAndConfirmations(candles: Candle[], atrPercent: num
     bearish.push("Avalement Baissier");
     bearScore += 15;
 
-    // CONFIRMATION STRICTE : Bougie 0 clôture baissière en dessous de l'avalement
     if (isBear0 && c0.close < c1.close) {
       bearScore += 15;
       confirmed = true;
@@ -560,12 +548,11 @@ function detectCandlePatternsAndConfirmations(candles: Candle[], atrPercent: num
     }
   }
 
-  // 5. MORNING STAR (ÉTOILE DU MATIN - RETOURNEMENT HAUSSIER MAJEUR EN 3 BOUGIES)
+  // 5. MORNING STAR
   if (isBear3 && body3 > avgBody * 0.6 && Math.abs(c2.close - c2.open) < body3 * 0.45 && isBull1 && c1.close > (c3.open + c3.close) / 2) {
     bullish.push("Étoile du Matin");
     bullScore += 20;
 
-    // CONFIRMATION STRICTE : C0 maintient la tendance et ferme plus haut que C1
     if (isBull0 && c0.close > c1.close) {
       bullScore += 12;
       confirmed = true;
@@ -575,12 +562,11 @@ function detectCandlePatternsAndConfirmations(candles: Candle[], atrPercent: num
     }
   }
 
-  // 6. EVENING STAR (ÉTOILE DU SOIR - RETOURNEMENT BAISSIER MAJEUR)
+  // 6. EVENING STAR
   if (isBull3 && body3 > avgBody * 0.6 && Math.abs(c2.close - c2.open) < body3 * 0.45 && isBear1 && c1.close < (c3.open + c3.close) / 2) {
     bearish.push("Étoile du Soir");
     bearScore += 20;
 
-    // CONFIRMATION STRICTE : C0 clôture plus bas et confirme l'inversion
     if (isBear0 && c0.close < c1.close) {
       bearScore += 12;
       confirmed = true;
@@ -590,7 +576,7 @@ function detectCandlePatternsAndConfirmations(candles: Candle[], atrPercent: num
     }
   }
 
-  // 7. TWEEZER BOTTOM (PINCES DE RETOURNEMENT HAUSSIER)
+  // 7. TWEEZER BOTTOM
   if (isBear2 && isBull1 && Math.abs(c1.low - c2.low) / (avgRange || 0.0001) < 0.08 && trendBearish) {
     bullish.push("Pince Haussière (Tweezer Bottom)");
     bullScore += 10;
@@ -602,7 +588,7 @@ function detectCandlePatternsAndConfirmations(candles: Candle[], atrPercent: num
     }
   }
 
-  // 8. TWEEZER TOP (PINCES DE RETOURNEMENT BAISSIER)
+  // 8. TWEEZER TOP
   if (isBull2 && isBear1 && Math.abs(c1.high - c2.high) / (avgRange || 0.0001) < 0.08 && trendBullish) {
     bearish.push("Pince Baissière (Tweezer Top)");
     bearScore += 10;
@@ -614,7 +600,7 @@ function detectCandlePatternsAndConfirmations(candles: Candle[], atrPercent: num
     }
   }
 
-  // 9. MARUBOZU D'IMPULSION SANS MÉCHES
+  // 9. MARUBOZU
   if (isBull1 && upperWick1 < body1 * 0.04 && lowerWick1 < body1 * 0.04 && body1 > avgBody * 1.4) {
     bullish.push("Marubozu d'Impulsion Acheteuse");
     bullScore += 12;
@@ -657,16 +643,15 @@ function createTradingPlan(signal: string, confidence: number, score: number, pr
   
   let finalRisk = baseRisk;
 
-  // Optimisation selon les S/R
   if (isBuy && Number.isFinite(support) && support > 0 && support < price) {
     const distanceToSupport = price - support;
     if (distanceToSupport < baseRisk * 1.6) {
-      finalRisk = Math.max(baseRisk, distanceToSupport * 1.08); // Placer le SL juste sous le support
+      finalRisk = Math.max(baseRisk, distanceToSupport * 1.08);
     }
   } else if (!isBuy && Number.isFinite(resistance) && resistance > price) {
     const distanceToRes = resistance - price;
     if (distanceToRes < baseRisk * 1.6) {
-      finalRisk = Math.max(baseRisk, distanceToRes * 1.08); // Placer le SL juste au-dessus de la résistance
+      finalRisk = Math.max(baseRisk, distanceToRes * 1.08);
     }
   }
 
@@ -674,7 +659,6 @@ function createTradingPlan(signal: string, confidence: number, score: number, pr
   const entrySpread = clamp(atrSafety * 0.12, price * 0.0001, price * 0.001);
   const stopLoss = isBuy ? entry - finalRisk : entry + finalRisk;
 
-  // Calcul des Take Profits optimisés pour un excellent rapport RR (Risk-Reward)
   const tp1 = isBuy ? entry + finalRisk * 1.15 : entry - finalRisk * 1.15;
   const tp2 = isBuy ? entry + finalRisk * 2.20 : entry - finalRisk * 2.20;
   const tp3 = isBuy ? entry + finalRisk * 3.40 : entry - finalRisk * 3.40;
@@ -716,7 +700,7 @@ function createTradingPlan(signal: string, confidence: number, score: number, pr
   };
 }
 
-// GENERATION COMPLETE DE SIGNAL AVEC FILTRES DE CONFIANCE ET CONFIRMATION CHANDELIER
+// GENERATION COMPLETE DE SIGNAL
 function runSignalEngine(candles: Candle[], news = ""): any {
   const MIN_CANDLES = 60;
   if (candles.length < MIN_CANDLES) {
@@ -733,14 +717,19 @@ function runSignalEngine(candles: Candle[], news = ""): any {
   }
 
   const closes = candles.map(c => c.close);
-  const last = candles.at(-1)!;
+  const last = candles[candles.length - 1]!;
   const currentPrice = last.close;
 
-  // Indicateurs techniques standardisés
-  const ema9 = calculateEMA(closes, 9).at(-1) ?? currentPrice;
-  const ema21 = calculateEMA(closes, 21).at(-1) ?? currentPrice;
-  const ema50 = calculateEMA(closes, 50).at(-1) ?? currentPrice;
-  const ema200 = calculateEMA(closes, 200).at(-1) ?? currentPrice;
+  // Optimisation CPU : Calcul des EMA exécuté une seule fois par variable
+  const ema9Array = calculateEMA(closes, 9);
+  const ema21Array = calculateEMA(closes, 21);
+  const ema50Array = calculateEMA(closes, 50);
+  const ema200Array = calculateEMA(closes, 200);
+
+  const ema9 = ema9Array[ema9Array.length - 1] ?? currentPrice;
+  const ema21 = ema21Array[ema21Array.length - 1] ?? currentPrice;
+  const ema50 = ema50Array[ema50Array.length - 1] ?? currentPrice;
+  const ema200 = ema200Array[ema200Array.length - 1] ?? currentPrice;
 
   const rsi7 = calculateRSI(closes, 7);
   const rsi14 = calculateRSI(closes, 14);
@@ -757,19 +746,13 @@ function runSignalEngine(candles: Candle[], news = ""): any {
   const srLevels = calculateSupportResistance(candles, 60, 3);
   const { support, resistance } = srLevels;
 
-  // 1. Détection des chandeliers et confirmation sur bougie suivante
   const patternResult = detectCandlePatternsAndConfirmations(candles, atrPercent);
 
-  // ============================================================
-  // SYSTEME MULTI-FACTEUR DE CALCUL DE CONFIANCE (0 - 100%)
-  // ============================================================
   const reasons: string[] = [];
   let bullConfidence = 0;
   let bearConfidence = 0;
   let confirmations = 0;
 
-  // --- FACTEUR 1 : Tendance & Alignement des SMA (Poids Max : 20%) ---
-  // Haussier
   if (ema9 > ema21 && ema21 > ema50) {
     bullConfidence += 15;
   } else if (ema9 > ema21) {
@@ -778,7 +761,6 @@ function runSignalEngine(candles: Candle[], news = ""): any {
   if (currentPrice > ema200) {
     bullConfidence += 5;
   }
-  // Baissier
   if (ema9 < ema21 && ema21 < ema50) {
     bearConfidence += 15;
   } else if (ema9 < ema21) {
@@ -788,12 +770,9 @@ function runSignalEngine(candles: Candle[], news = ""): any {
     bearConfidence += 5;
   }
 
-  // --- FACTEUR 2 : Momentum, RSI et Stochastique (Poids Max : 20%) ---
-  // Haussier
   if (rsi14 > 50 && rsi14 <= 70) {
     bullConfidence += 10;
   } else if (rsi14 > 70) {
-    // Surchauffe
     bullConfidence += 3;
   }
   if (rsi7 > 55 && rsi7 < 80) {
@@ -806,11 +785,9 @@ function runSignalEngine(candles: Candle[], news = ""): any {
     bullConfidence += 3;
   }
 
-  // Baissier
   if (rsi14 < 50 && rsi14 >= 30) {
     bearConfidence += 10;
   } else if (rsi14 < 30) {
-    // Surchauffe basse
     bearConfidence += 3;
   }
   if (rsi7 < 45 && rsi7 > 20) {
@@ -823,7 +800,6 @@ function runSignalEngine(candles: Candle[], news = ""): any {
     bearConfidence += 3;
   }
 
-  // --- FACTEUR 3 : Alignement Vol-Ratio / Volume de Confirmation (Poids : 10%) ---
   const lastVol = last.volume || 1;
   const recentVols = candles.slice(-10, -1).map(c => c.volume);
   const medianVol = median(recentVols) || 1;
@@ -843,8 +819,6 @@ function runSignalEngine(candles: Candle[], news = ""): any {
     }
   }
 
-  // --- FACTEUR 4 : MACD, VWAP & Bollinger (Poids Max : 15%) ---
-  // Haussier
   if (macd.bullCross) {
     bullConfidence += 8;
   } else if (macd.histogram > 0) {
@@ -854,10 +828,9 @@ function runSignalEngine(candles: Candle[], news = ""): any {
     bullConfidence += 4;
   }
   if (bb.percentB < 0.2) {
-    bullConfidence += 3; // Rejet de bande basse
+    bullConfidence += 3;
   }
 
-  // Baissier
   if (macd.bearCross) {
     bearConfidence += 8;
   } else if (macd.histogram < 0) {
@@ -867,16 +840,14 @@ function runSignalEngine(candles: Candle[], news = ""): any {
     bearConfidence += 4;
   }
   if (bb.percentB > 0.8) {
-    bearConfidence += 3; // Rejet de bande haute
+    bearConfidence += 3;
   }
 
-  // --- FACTEUR 5 : Chandeliers Japonais & Bougies de Confirmation (Poids Max : 35%) ---
-  // C'est le pilier central de l'algorithme stabilisé
   if (patternResult.bullScore > 0) {
     bullConfidence += 15;
     reasons.push(`[Chandelier] Pattern haussier repéré : ${patternResult.bullish.join(", ")}`);
     if (patternResult.confirmed) {
-      bullConfidence += 20; // +20% de confiance si la bougie C0 confirme le signal !
+      bullConfidence += 20;
       confirmations += 2;
     } else {
       reasons.push(`[Chandelier] Signal haussier non validé par la bougie de confirmation C0`);
@@ -887,14 +858,13 @@ function runSignalEngine(candles: Candle[], news = ""): any {
     bearConfidence += 15;
     reasons.push(`[Chandelier] Pattern baissier repéré : ${patternResult.bearish.join(", ")}`);
     if (patternResult.confirmed) {
-      bearConfidence += 20; // +20% de confiance si confirmée par C0 !
+      bearConfidence += 20;
       confirmations += 2;
     } else {
       reasons.push(`[Chandelier] Signal baissier non validé par la bougie de confirmation C0`);
     }
   }
 
-  // --- APPLICATIONS DES FILTRES DE VOLATILITÉ ET COMPRESSION ---
   if (patternResult.volatilityRating === "EXCESSIF") {
     bullConfidence -= 18;
     bearConfidence -= 18;
@@ -905,11 +875,10 @@ function runSignalEngine(candles: Candle[], news = ""): any {
     reasons.push(`⚠️ Force de marché comprimée (Volume/Portée dérisoires). Risque de stagnation, penalty appliqué`);
   } else if (patternResult.volatilityRating === "STABLE") {
     if (bullConfidence > bearConfidence) bullConfidence += 5;
-    else if (bearConfidence > bullConfidence) bearConfidence += 5;
+    else if (bearConfidence > bullConfidence) bullConfidence += 5;
     reasons.push(`✓ Conditions de volatilité idéales ("STABLE"). Signal favorisé`);
   }
 
-  // Sentiment News additionnel si renseigné
   const normalizedNews = news.toLowerCase();
   if (normalizedNews.includes("bull") || normalizedNews.includes("long") || normalizedNews.includes("pump")) {
     bullConfidence += 10;
@@ -919,13 +888,9 @@ function runSignalEngine(candles: Candle[], news = ""): any {
     reasons.push("Sentiment de news négatif");
   }
 
-  // Nettoyage et clamp final
   bullConfidence = clamp(bullConfidence, 0, 99);
   bearConfidence = clamp(bearConfidence, 0, 99);
 
-  // ============================================================
-  // ENFORCEMENT STRICT DE LA RÈGLE DES 70%
-  // ============================================================
   let signal = "HOLD";
   let confidence = 0;
 
@@ -941,7 +906,6 @@ function runSignalEngine(candles: Candle[], news = ""): any {
     }
   }
 
-  // Si on est en HOLD parce qu'aucun ne dépasse 70%
   if (signal === "HOLD") {
     reasons.push(`Seuil de confiance de 70% non atteint. (Bull : ${bullConfidence}%, Bear : ${bearConfidence}%). Standby (HOLD).`);
   } else {
@@ -956,9 +920,7 @@ function runSignalEngine(candles: Candle[], news = ""): any {
     return "FAIBLE";
   }
 
-  // Calcul du score technique net d'orientation pour la compatibilité d'affichage
   const netScore = round(bullConfidence - bearConfidence, 1);
-
   const tradePlan = createTradingPlan(signal, confidence, netScore, currentPrice, atr, support, resistance, bb.percentB);
 
   return {
@@ -1004,13 +966,11 @@ function runSignalEngine(candles: Candle[], news = ""): any {
   };
 }
 
-// RESOLUTION DES LOCKS POUR VERROUILLER LE PLAN DE TRADING ET LES OBJECTIFS TP/SL PRECIS SUR 3 MINUTES
 function resolveStabilizedSignal(key: string, freshAnalysis: any): any {
   const now = Date.now();
   const existing = getLockedSignal(key);
 
   if (!existing) {
-    // Si aucun lock n'existe, et que la nouvelle analyse produit un BUY ou SELL fort (avec confiance >= 70%)
     if (freshAnalysis.signal !== "HOLD" && freshAnalysis.confidence >= 70) {
       const lock: SignalLock = {
         signal:      freshAnalysis.signal,
@@ -1018,17 +978,15 @@ function resolveStabilizedSignal(key: string, freshAnalysis: any): any {
         score:       freshAnalysis.score,
         lockedAt:    now,
         expiresAt:   now + SIGNAL_LOCK_MS,
-        tradePlan:   freshAnalysis.tradePlan, // On fige l'entry, SL et TPs!
+        tradePlan:   freshAnalysis.tradePlan,
         reasons:     [...freshAnalysis.reasons]
       };
       SIGNAL_LOCKS.set(key, lock);
       return buildLockedResponse(lock, freshAnalysis, now);
     }
-    // Si HOLD, on retourne simplement l'analyse fraîche sans verrouillage
     return buildLockedResponse(null, freshAnalysis, now);
   }
 
-  // Si un lock existe déjà, on RESTE rigoureusement verrouillé sur ce signal et son plan de trading associé
   return buildLockedResponse(existing, freshAnalysis, now);
 }
 
@@ -1052,7 +1010,7 @@ function buildLockedResponse(lock: SignalLock | null, freshAnalysis: any, now: n
       countdown:      isLocked ? `${minutesRemaining}:${String(secsDisplay).padStart(2, '0')}` : null,
       lockDurationMs: SIGNAL_LOCK_MS
     },
-    tradePlan: isLocked ? lock.tradePlan : freshAnalysis.tradePlan, // Strict figeage du plan de trading SL/TP-ENTRY!
+    tradePlan: isLocked ? lock.tradePlan : freshAnalysis.tradePlan,
     indicators: freshAnalysis.indicators,
     reasons: isLocked
       ? [...lock.reasons, `🔒 SIGNAL BLOQUÉ — Données fixes pour encore ${minutesRemaining}m ${secsDisplay}s (Stabilité)` ]
@@ -1082,7 +1040,7 @@ function normalizeCandles(candles: any[]): Candle[] {
 function applyCurrentPrice(candles: Candle[], currentPrice: number): Candle[] {
   if (!candles.length || !Number.isFinite(currentPrice) || currentPrice <= 0) return candles;
   const updated = candles.map(c => ({ ...c }));
-  const last = updated.at(-1)!;
+  const last = updated[updated.length - 1]!;
   last.close = currentPrice;
   last.high  = Math.max(last.high, currentPrice);
   last.low   = Math.min(last.low,  currentPrice);
@@ -1146,7 +1104,7 @@ async function fetchBinanceCrypto(pair: any, timeConfig: IntervalConfig) {
     time: c[0], open: c[1], high: c[2], low: c[3], close: c[4], volume: c[5]
   }));
   const candles = normalizeCandles(rawCandles);
-  const currentPrice = Number(tickerResponse?.data?.price) || candles.at(-1)?.close || 0;
+  const currentPrice = Number(tickerResponse?.data?.price) || candles[candles.length - 1]?.close || 0;
   return { candles: applyCurrentPrice(candles, currentPrice), currentPrice, source: `Binance Spot (${pair.binanceSymbol})` };
 }
 
@@ -1160,9 +1118,8 @@ async function fetchBybitCrypto(pair: any, timeConfig: IntervalConfig) {
   const rawCandles = (response.data?.result?.list || []).map((c: any) => ({
     time: Number(c[0]), open: c[1], high: c[2], low: c[3], close: c[4], volume: c[5]
   }));
-  // Bybit retourne les chandelles de la plus récente à la plus ancienne, on les normalisera (triées par temps ascendant)
   const candles = normalizeCandles(rawCandles);
-  return { candles, currentPrice: candles.at(-1)?.close ?? 0, source: `Bybit Spot (${pair.bybitSymbol})` };
+  return { candles, currentPrice: candles[candles.length - 1]?.close ?? 0, source: `Bybit Spot (${pair.bybitSymbol})` };
 }
 
 // FETCH DE DONNÉES COINBASE PRO
@@ -1184,11 +1141,11 @@ async function fetchCoinbaseCrypto(pair: any, timeConfig: IntervalConfig) {
     time: c[0] * 1000, low: c[1], high: c[2], open: c[3], close: c[4], volume: c[5]
   }));
   const candles = normalizeCandles(rawCandles);
-  const currentPrice = Number(tickerResponse?.data?.price) || candles.at(-1)?.close || 0;
+  const currentPrice = Number(tickerResponse?.data?.price) || candles[candles.length - 1]?.close || 0;
   return { candles: applyCurrentPrice(candles, currentPrice), currentPrice, source: `Coinbase Pro (${pair.coinbaseProduct})` };
 }
 
-// LAUNCHERS SELECTOR POUR CONTOURNER LES CRASHES DE SOURCE
+// LAUNCHERS SELECTOR
 async function fetchCryptoMarket(rawSymbol: string, timeConfig: IntervalConfig, preferredProvider = "") {
   const pair = normalizeCryptoPair(rawSymbol);
   const order = preferredProvider === "bybit" ? ["bybit", "binance", "coinbase"] : ["binance", "bybit", "coinbase"];
@@ -1206,7 +1163,7 @@ async function fetchCryptoMarket(rawSymbol: string, timeConfig: IntervalConfig, 
   throw new Error(`Échec de toutes les sources crypto : ${errors.join(" | ")}`);
 }
 
-// FETCH TRADITIONNEL (INDEX/FOREX) VIA YAHOO FINANCE
+// FETCH TRADITIONNEL VIA YAHOO FINANCE
 async function fetchYahooMarket(rawSymbol: string, type: string, timeConfig: IntervalConfig) {
   const yahooSymbol = resolveYahooSymbol(rawSymbol, type);
   const endpoints = [
@@ -1244,7 +1201,7 @@ async function fetchYahooMarket(rawSymbol: string, type: string, timeConfig: Int
         close: quote.close?.[i],
         volume: quote.volume?.[i] || 0
       })));
-      const currentPrice = Number(result?.meta?.regularMarketPrice) || candles.at(-1)?.close || 0;
+      const currentPrice = Number(result?.meta?.regularMarketPrice) || candles[candles.length - 1]?.close || 0;
       return { candles: applyCurrentPrice(candles, currentPrice), currentPrice, source: `Yahoo Finance (${yahooSymbol})` };
     } catch (err) {
       lastError = err;
@@ -1262,8 +1219,7 @@ async function fetchMarketData({ symbol, type, timeConfig, provider }: { symbol:
 // ROUTES DE L'API REST
 // ============================================================
 
-// Statut et variables globales
-app.get("/api/health", (req, res) => {
+app.get("/api/health", (req: Request, res: Response) => {
   res.json({
     status: "ok",
     uptime: round(process.uptime(), 2),
@@ -1277,8 +1233,7 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-// Récupérer tous les signaux actuellement verrouillés (pour l'UI)
-app.get("/api/locks", (req, res) => {
+app.get("/api/locks", (req: Request, res: Response) => {
   const now = Date.now();
   const activeLocks: any[] = [];
   for (const [key, lock] of SIGNAL_LOCKS.entries()) {
@@ -1302,8 +1257,7 @@ app.get("/api/locks", (req, res) => {
   res.json({ activeLocks, count: activeLocks.length });
 });
 
-// Forcer la suppression d'un lock depuis l'UI (super utile pour le débug ou réinitialiser)
-app.post("/api/reset-lock", (req, res) => {
+app.post("/api/reset-lock", (req: Request, res: Response) => {
   const { key } = req.body;
   if (key && SIGNAL_LOCKS.has(key)) {
     SIGNAL_LOCKS.delete(key);
@@ -1314,9 +1268,13 @@ app.post("/api/reset-lock", (req, res) => {
 });
 
 // ROUTE DU FILTRAGE DU MARCHÉ STABILISE (PRINCIPALE)
-app.get("/api/market", async (req, res) => {
+app.get("/api/market", async (req: Request, res: Response) => {
   try {
-    let { symbol, type = "crypto", interval = "15m", news = "", provider = "" } = req.query;
+    const symbol = req.query.symbol;
+    const type = req.query.type || "crypto";
+    const interval = req.query.interval || "15m";
+    const news = req.query.news || "";
+    const provider = req.query.provider || "";
 
     if (!symbol) {
       return res.status(400).json({ error: "Le paramètre 'symbol' est requis" });
@@ -1335,15 +1293,10 @@ app.get("/api/market", async (req, res) => {
     const cacheKey = `${cleanType}-${sym}-${targetInterval}-${provider}`;
     const lockKey = `${cleanType}-${compactSymbol(sym)}-${targetInterval}`;
 
-    // 1. Avant d'aller chercher de nouvelles données en réseau, on regarde si le signal est locké.
-    // Mais on veut toujours afficher les dernières bougies à l'utilisateur!
-    // Donc on va chercher les données réseau, et on passera le signal fresh dans resolveStabilizedSignal
-    
-    // Vérification du Cache de Données Locales d'abord pour soulager les API tierces
-    let marketData: any;
+    // OPTIMISATION CACHE : Si les données en cache sont valides, renvoyer la réponse immédiatement.
     const cachedItem = CACHE.get(cacheKey);
     if (cachedItem && (Date.now() - cachedItem.timestamp < timeConfig.cache)) {
-      marketData = cachedItem.rawAnalysis;
+      return res.json(cachedItem.data);
     }
 
     let candles: Candle[] = [];
@@ -1356,7 +1309,6 @@ app.get("/api/market", async (req, res) => {
       currentPrice = fetched.currentPrice;
       source = fetched.source;
     } catch (fetchErr: any) {
-      // Fallback au cache s'il existe, même expiré
       if (cachedItem) {
         candles = cachedItem.data.candles || [];
         currentPrice = cachedItem.data.marketPrice || 0;
@@ -1374,7 +1326,6 @@ app.get("/api/market", async (req, res) => {
       });
     }
 
-    // Calcul des signaux stabilisés
     const freshAnalysis = runSignalEngine(candles, String(news));
     const stabilizedResult = resolveStabilizedSignal(lockKey, freshAnalysis);
 
@@ -1385,12 +1336,11 @@ app.get("/api/market", async (req, res) => {
       marketPrice: currentPrice,
       formattedPrice: formatPrice(currentPrice),
       source,
-      candles: candles.slice(-80), // On envoie les 80 dernières bougies pour afficher un beau graphique dans notre dashboard
+      candles: candles.slice(-80),
       ...stabilizedResult,
       timestamp: new Date().toISOString()
     };
 
-    // Mettre à jour le cache
     CACHE.set(cacheKey, { data, rawAnalysis: freshAnalysis, timestamp: Date.now() });
 
     return res.json(data);
@@ -1404,33 +1354,29 @@ app.get("/api/market", async (req, res) => {
   }
 });
 
-
 // ============================================================
-// INTEGRATION ET LANCEMENT DU FRONTEND ET DU RETAPE SERVEUR
+// INTEGRATION ET LANCEMENT DU FRONTEND
 // ============================================================
 async function launchFullStack() {
-  // En mode développement, on lance le Vite Dev Server comme middleware
   if (process.env.NODE_ENV !== "production") {
     console.log("[DevServer] Chargement de Vite Dev Server en middleware...");
+    const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa"
     });
     
-    // Le serveur Vite redirige tous les fichiers non gérés par express vers le frontend React
     app.use(vite.middlewares);
   } else {
-    // En production, Express héberge le build statique de Vite dans /dist
     console.log("[ProdServer] Hébergement du build statique depuis /dist...");
     const distPath = path.join(process.cwd(), "dist");
     
     app.use(express.static(distPath));
-    app.get("*", (req, res) => {
+    app.get("*", (req: Request, res: Response) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
 
-  // Le PORT est imposé par la plateforme à 3000
   app.listen(PORT, HOST, () => {
     console.log(`\n======================================================`);
     console.log(`🟢 SERVER RUNNING AT http://localhost:${PORT}`);
