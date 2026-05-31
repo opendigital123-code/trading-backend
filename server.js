@@ -15,7 +15,7 @@ app.use(express.json());
 const CACHE = new Map();
 const SIGNAL_LOCKS = new Map();
 const AXIOS_TIMEOUT = Number(process.env.MARKET_TIMEOUT_MS || 8000);
-const SIGNAL_COOLDOWN_MS = 5 * 60 * 1000; // ← 3→5 min: évite les re-signaux rapides
+const SIGNAL_COOLDOWN_MS = 5 * 60 * 1000; // ← Cooldown de 5 min entre deux signaux forts
 
 const HTTP = axios.create({
   timeout: AXIOS_TIMEOUT,
@@ -242,7 +242,6 @@ function calculateMACD(prices) {
   const validMacd = macdLine.filter(Number.isFinite);
   const signalLine = calculateEMA(validMacd, 9);
 
-  // ← NOUVEAU: histogramme des N dernières valeurs pour la divergence
   const histValues = [];
   for (let i = Math.max(0, validMacd.length - 5); i < validMacd.length; i++) {
     const sig = signalLine[i - (validMacd.length - signalLine.length)];
@@ -253,7 +252,7 @@ function calculateMACD(prices) {
     macd:        macdLine.at(-1) || 0,
     signal:      signalLine.at(-1) || 0,
     histogram:   (macdLine.at(-1) || 0) - (signalLine.at(-1) || 0),
-    histValues   // utilisé pour la divergence
+    histValues
   };
 }
 
@@ -310,7 +309,6 @@ function calculateSupportResistance(candles, period = 40) {
   };
 }
 
-// ← NOUVEAU: détection de divergence RSI / prix sur N bougies
 function detectRSIDivergence(prices, period = 14, lookback = 10) {
   if (prices.length < period + lookback + 2) return null;
 
@@ -329,13 +327,11 @@ function detectRSIDivergence(prices, period = 14, lookback = 10) {
   const lastPrice = priceSlice.at(-1);
   const lastRsi   = rsiValues.at(-1);
 
-  // Divergence haussière : prix fait un nouveau bas mais RSI remonte
   const isBullishDiv =
     lastPrice <= priceLow * 1.005 &&
     lastRsi > rsiLow + 3 &&
     lastRsi < 45;
 
-  // Divergence baissière : prix fait un nouveau haut mais RSI baisse
   const isBearishDiv =
     lastPrice >= priceHigh * 0.995 &&
     lastRsi < rsiHigh - 3 &&
@@ -346,7 +342,6 @@ function detectRSIDivergence(prices, period = 14, lookback = 10) {
   return null;
 }
 
-// ← NOUVEAU: détection de divergence MACD / prix
 function detectMACDDivergence(prices, histValues, lookback = 8) {
   if (!histValues || histValues.length < 4) return null;
   if (prices.length < lookback + 2) return null;
@@ -372,9 +367,8 @@ function detectMACDDivergence(prices, histValues, lookback = 8) {
 
 function getClosedCandles(candles, intervalMs, now = Date.now()) {
   if (!intervalMs) return candles;
-  // ← Filtre strict : on n'inclut que les bougies réellement clôturées
-  const closed = candles.filter(c => c.time + intervalMs <= now);
-  // Le fallback slice(0,-1) reste mais uniquement si on a vraiment peu de données
+  // Ajout d'une marge de tolérance de 10 secondes pour compenser les désynchronisations d'horloge mineures
+  const closed = candles.filter(c => c.time + intervalMs <= now + 10000);
   if (closed.length < 30) return candles.slice(0, -1);
   return closed;
 }
@@ -889,14 +883,13 @@ function generateScalpingSignal(candles, options = {}) {
 
   const candlestickSetup  = detectCandlestickSetup(analysisCandles);
 
-  // ← NOUVEAU: divergences
   const rsiDivergence  = detectRSIDivergence(closes, 14, 10);
   const macdDivergence = detectMACDDivergence(closes, macd.histValues, 8);
 
   let score = 0;
   const reasons = [];
 
-  // — Tendance EMA (inchangé) —
+  // — Tendance EMA —
   if (ema9 > ema21 && ema21 > ema50) {
     score += 22;
     reasons.push('Tendance courte haussiere');
@@ -905,7 +898,6 @@ function generateScalpingSignal(candles, options = {}) {
     reasons.push('Tendance courte baissiere');
   }
 
-  // ← NOUVEAU: alignement EMA9/21 seul (tendance partielle)
   if (ema9 > ema21 && !(ema21 > ema50)) {
     score += 8;
     reasons.push('EMA9 > EMA21 (tendance courte naissante)');
@@ -922,7 +914,7 @@ function generateScalpingSignal(candles, options = {}) {
   if (price > vwap) score += 9;
   if (price < vwap) score -= 9;
 
-  // — MACD (inchangé) —
+  // — MACD —
   if (macd.histogram > 0 && macd.macd > macd.signal) {
     score += 10;
     reasons.push('MACD positif');
@@ -931,12 +923,10 @@ function generateScalpingSignal(candles, options = {}) {
     reasons.push('MACD negatif');
   }
 
-  // — RSI étendu (pondération renforcée) —
-  // ← Zones RSI moyennes: contribution normale
+  // — RSI étendu —
   if (rsi14 >= 55 && rsi14 <= 70) score += 9;
   if (rsi14 <= 45 && rsi14 >= 30) score -= 9;
 
-  // ← MODIFIÉ: RSI extrême → filtre fort (survente/surachat sévère = contre-signal)
   if (rsi7 > 80) {
     score -= 14;
     reasons.push('RSI7 suracheté (>80): risque de retournement');
@@ -951,7 +941,6 @@ function generateScalpingSignal(candles, options = {}) {
     score += 7;
   }
 
-  // ← MODIFIÉ: RSI14 extrême bloque le signal dans sa direction
   if (rsi14 > 78 && score > 0) {
     score *= 0.6;
     reasons.push('RSI14 suracheté: signal BUY attenue');
@@ -970,7 +959,7 @@ function generateScalpingSignal(candles, options = {}) {
     reasons.push('Momentum vendeur');
   }
 
-  // ← MODIFIÉ: volume renforcé (+10 au lieu de +5)
+  // — Volumes (Optimisés) —
   if (volumeRatio > 1.5 && last.close > last.open) {
     score += 10;
     reasons.push('Volume fort haussier');
@@ -984,9 +973,8 @@ function generateScalpingSignal(candles, options = {}) {
     score -= 5;
   }
 
-  // ← NOUVEAU: faible volume = signal peu fiable
   if (volumeRatio < 0.5) {
-    score *= 0.8;
+    score *= 0.90; // Pénalité adoucie (0.90 au lieu de 0.8) pour ne pas bloquer les tendances lentes
     reasons.push('Volume faible: signal attenue');
   }
 
@@ -994,7 +982,7 @@ function generateScalpingSignal(candles, options = {}) {
   if (nearSupport < 0.18 && price > previous.close)    score += 5;
   if (nearResistance < 0.18 && price < previous.close) score -= 5;
 
-  // — Patterns chandeliers (inchangé) —
+  // — Patterns chandeliers (Optimisés) —
   if (candlestickSetup?.confirmed) {
     const isBullishSetup = candlestickSetup.direction === 'bullish';
     score += isBullishSetup ? 24 : -24;
@@ -1010,12 +998,13 @@ function generateScalpingSignal(candles, options = {}) {
     }
   } else if (candlestickSetup) {
     reasons.push(`${candlestickSetup.name} detecte sans confirmation`);
-    score *= 0.82;
+    score *= 0.85; // Adouci à 0.85 (au lieu de 0.82)
   } else {
-    score *= 0.92;
+    // Suppression de l'ancienne réduction de score arbitraire (score *= 0.92)
+    // L'absence de pattern n'est pas un contre-signal mais un état neutre.
   }
 
-  // ← NOUVEAU: divergences RSI
+  // — Divergences —
   if (rsiDivergence?.type === 'bullish') {
     score += 18;
     reasons.push(`Divergence RSI haussiere (RSI ${rsiDivergence.rsi})`);
@@ -1024,7 +1013,6 @@ function generateScalpingSignal(candles, options = {}) {
     reasons.push(`Divergence RSI baissiere (RSI ${rsiDivergence.rsi})`);
   }
 
-  // ← NOUVEAU: divergences MACD
   if (macdDivergence?.type === 'bullish') {
     score += 12;
     reasons.push('Divergence MACD haussiere');
@@ -1033,35 +1021,34 @@ function generateScalpingSignal(candles, options = {}) {
     reasons.push('Divergence MACD baissiere');
   }
 
-  // — Volatilité (filtre, inchangé) —
+  // — Volatilité —
   if (atrPercent > 4) {
     score *= 0.85;
     reasons.push('Volatilite elevee');
   }
 
-  // ← NOUVEAU: ATR très faible = marché plat, pas d'entrée scalping
   if (atrPercent < 0.1) {
-    score *= 0.5;
+    score *= 0.75; // Pénalité adoucie (0.75 au lieu de 0.5) pour permettre le trading de paires à faible spread
     reasons.push('ATR tres faible: marche plat, scalping risque');
   }
 
   // — News —
   score += normalizeNewsScore(options.news);
 
-  // ← MODIFIÉ: confidence découplée du score brut
-  // On utilise une fonction sigmoid normalisée pour éviter la circularité
-  const absScore  = Math.abs(score);
-  // Sigmoid: confidence monte graduellement, plafonnée à 95
+  // — Confiance & Signaux (Ajustés pour réduire le "HOLD" constant) —
+  const absScore = Math.abs(score);
+  
+  // Calibrage de la sigmoïde pour être alignée avec le seuil réactif de 60
   const confidence = Math.min(95, Math.round(
-    95 / (1 + Math.exp(-0.07 * (absScore - 55)))
+    95 / (1 + Math.exp(-0.08 * (absScore - 45)))
   ));
 
-  // ← MODIFIÉ: seuil relevé à 75 (vs 70 avant)
+  // Ajustement du seuil de déclenchement de 75 à 60
   let signal = 'HOLD';
-  if (score >= 75 && confidence >= 55) signal = 'BUY';
-  if (score <= -75 && confidence >= 55) signal = 'SELL';
+  if (score >= 60 && confidence >= 50) signal = 'BUY';
+  if (score <= -60 && confidence >= 50) signal = 'SELL';
 
-  if (signal === 'HOLD' && confidence < 55) {
+  if (signal === 'HOLD' && confidence < 50) {
     reasons.push('Confiance insuffisante: HOLD obligatoire');
   }
 
@@ -1103,7 +1090,6 @@ function generateScalpingSignal(candles, options = {}) {
     candlestickPattern: candlestickSetup
       ? { name: candlestickSetup.name, direction: candlestickSetup.direction, confirmed: candlestickSetup.confirmed }
       : null,
-    // ← NOUVEAU: divergences exposées dans la réponse
     divergences: {
       rsi:  rsiDivergence  || null,
       macd: macdDivergence || null
